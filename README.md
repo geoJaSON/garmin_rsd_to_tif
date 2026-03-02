@@ -1,0 +1,112 @@
+# Garmin Sidescan Mosaic Generator
+
+Converts Garmin RSD sidescan sonar files into georeferenced GeoTIFF mosaics. Uses [PINGVerter](https://github.com/CameronBodine/PINGVerter) to extract per-ping metadata, then applies a full radiometric and geometric correction pipeline.
+
+## Outputs
+
+| File | Description |
+|------|-------------|
+| `intensity.tif` | Merged port + starboard backscatter mosaic |
+| `texture.tif` | Local standard deviation texture map (high = rough/hard bottom) |
+| `port_intensity.tif` | Port-side backscatter only |
+| `star_intensity.tif` | Starboard-side backscatter only |
+
+All outputs are uint8 GeoTIFFs in the auto-detected UTM projection with LZW compression.
+
+## Processing Pipeline
+
+1. **Metadata extraction** - PINGVerter parses the RSD binary format into per-ping CSV metadata (position, heading, depth, range, speed)
+2. **Stationary ping rejection** - Drops pings below a speed threshold to prevent GPS pileup
+3. **TVG correction** - Compensates for acoustic spreading and absorption loss in dB space: `TVG(dB) = S * log10(R) + 2 * α * R`
+4. **Slant-to-ground range correction** - Converts acoustic travel time to horizontal distance using `Rg = sqrt(Rs² - H²)`, with nadir zone masking
+5. **Heading smoothing** - Recomputes course-over-ground with a wide window and circular moving average to reduce GPS jitter
+6. **Empirical Gain Normalization (EGN)** - Removes across-track beam pattern using column-wise mean normalization
+7. **Despeckle** - Median filter to suppress speckle noise (applied after EGN to preserve beam pattern statistics)
+8. **Georeferencing** - Projects each ping's scan line into a UTM raster grid with overlap averaging
+9. **Interpolated gap fill** - Linearly interpolates ping positions between adjacent pings to fill along-track gaps
+10. **Raster gap fill** - Iterative neighbor-mean fill to close remaining single-pixel gaps from scan line divergence at far range
+11. **Percentile contrast stretch** - Maps the 2nd-98th percentile range to 1-255 for consistent display contrast
+12. **Port/starboard merge** - Both sides painted into a single raster with overlap averaging in the nadir zone
+
+The entire pipeline operates in float32 to avoid cumulative uint8 quantization error. Conversion to uint8 happens only at the final output stage.
+
+## Setup
+
+### Requirements
+
+- Python 3.9+
+- Dependencies listed in `requirements.txt`
+
+### Install
+
+```bash
+# Create virtual environment
+python -m venv .venv
+
+# Activate (Windows PowerShell)
+.\.venv\Scripts\Activate.ps1
+
+# Activate (Linux/macOS)
+source .venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+Or use the provided setup script (Windows PowerShell):
+
+```powershell
+.\setup_env.ps1
+```
+
+## Usage
+
+1. Set the `RSD_FILE` path at the top of `garmin_mosaic.py` to point to your Garmin `.RSD` file
+2. Run the script:
+
+```bash
+python garmin_mosaic.py
+```
+
+Output files are saved to a `garmin_output_<filename>/processed/` directory next to the input RSD file.
+
+## Configuration
+
+All parameters are defined at the top of `garmin_mosaic.py`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `OUTPUT_RESOLUTION` | `0.05` | Pixel size in meters (5cm) |
+| `TVG_SPREADING_DB` | `30.0` | Spreading loss compensation (20-40 dB) |
+| `ABSORPTION_COEFF` | `0.05` | Absorption loss in dB/m (0.03-0.06 fresh, 0.1-0.2 salt at 455kHz) |
+| `APPLY_DESPECKLE` | `True` | Enable/disable median filter |
+| `DESPECKLE_SIZE` | `3` | Median filter kernel size |
+| `HEADING_SMOOTH_WINDOW` | `100` | Heading smoothing window in pings |
+| `MIN_SPEED_MS` | `0.3` | Minimum vessel speed to include a ping (m/s) |
+| `FILL_GAPS` | `True` | Enable inter-ping position interpolation |
+| `MAX_FILL_DISTANCE` | `2.0` | Maximum gap to interpolate between pings (meters) |
+| `NADIR_MASK_BINS` | `5` | Ground-range bins to mask at nadir |
+| `GAP_FILL_PASSES` | `3` | Post-processing neighbor-mean gap fill iterations |
+| `STRETCH_LOW_PCT` | `2` | Lower percentile for contrast stretch |
+| `STRETCH_HIGH_PCT` | `98` | Upper percentile for contrast stretch |
+| `TEXTURE_WINDOW_SIZE` | `15` | Texture analysis window in pixels |
+
+## How It Works
+
+### TVG (Time Varied Gain)
+
+Garmin consumer sidescan units record raw acoustic intensity that fades with range due to geometric spreading and water absorption. The TVG correction compensates for this in dB space, applying a range-dependent gain before any other processing.
+
+### Slant Range Correction
+
+Raw sidescan data is in slant range (acoustic travel time). This step converts to ground range using the Pythagorean relationship with the transducer-to-bottom depth (`inst_dep_m` from the Garmin bottom tracker). The first few ground-range bins near nadir are masked because the geometric correction is most unstable there.
+
+### UTM Projection
+
+The script auto-detects the correct UTM zone from the GPS data centroid instead of using Web Mercator (EPSG:3857), which introduces distance and area distortion that varies with latitude. This ensures the 5cm pixel size is accurate in real-world units.
+
+### Gap Filling
+
+Two complementary strategies are used:
+- **Inter-ping interpolation**: Between each pair of adjacent pings, intermediate positions are interpolated and painted using the nearest ping's intensity data
+- **Raster neighbor fill**: After all pings are painted, remaining single-pixel gaps (caused by scan line divergence at far range) are filled using iterative neighbor-mean interpolation
