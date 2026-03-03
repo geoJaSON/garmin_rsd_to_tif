@@ -38,11 +38,15 @@ RSD_PARENT_DIR = os.path.dirname(RSD_FILE)
 OUTPUT_BASE_DIR = os.path.join(RSD_PARENT_DIR, f"garmin_output_{RSD_BASENAME}")
 META_DIR = os.path.join(OUTPUT_BASE_DIR, "meta")
 OUTPUT_DIR = os.path.join(OUTPUT_BASE_DIR, "processed")
+ALL_META_FILE = os.path.join(META_DIR, "All-Garmin-Sonar-MetaData.csv")
 
 # Processing Parameters
 OUTPUT_RESOLUTION = 0.05    # 5cm per pixel
 TEXTURE_WINDOW_SIZE = 15    # Texture analysis window (~1.5m at 5cm res)
 MAX_RANGE_FALLBACK = 15.0   # Fallback if per-ping max_range not in metadata
+PORT_MAX_RANGE_OVERRIDE_M = 15.0  # Force port swath width when using alternate channel source
+PORT_RANGE_SCALE = 1.0            # Additional multiplicative range tuning for port
+STARBOARD_RANGE_SCALE = 1.0       # Additional multiplicative range tuning for starboard
 
 # Radiometric Corrections
 APPLY_TVG = True
@@ -78,19 +82,36 @@ LOG_COMPRESSION_SCALE = 6.0   # Higher = stronger highlight compression
 # Record/payload decoding
 PAYLOAD_PROBE_PINGS = 150     # Number of pings used to auto-select payload decoding mode
 FALLBACK_SAMPLE_COUNT = 2048  # Fallback sample count when metadata ping_cnt is missing
-PAYLOAD_MODES = ["u8_tail", "u8_even", "u8_odd", "u16_le", "u16_be", "u16_le_hi", "u16_le_lo"]
+PAYLOAD_MODES = [
+    "u8_tail", "u8_even", "u8_odd", "u16_le", "u16_be", "u16_le_hi", "u16_le_lo",
+    "son_u8", "son_even", "son_odd", "son_u16_le", "son_u16_be",
+]
 PAYLOAD_EXTRA_MODES = [
     "u8_tail_s16", "u8_even_s16", "u8_odd_s16", "u16_le_s16", "u16_be_s16",
+    "u8_tail_s23", "u8_even_s23", "u8_odd_s23", "u16_le_s23", "u16_be_s23",
+    "u8_tail_s24", "u8_even_s24", "u8_odd_s24", "u16_le_s24", "u16_be_s24",
     "u8_tail_s32", "u8_even_s32", "u8_odd_s32", "u16_le_s32", "u16_be_s32",
 ]
 PAYLOAD_MODE_OVERRIDE_PORT = "u8_odd"       # "auto" or one of PAYLOAD_MODES
 PAYLOAD_MODE_OVERRIDE_STARBOARD = "u8_odd"  # "auto" or one of PAYLOAD_MODES
-ENABLE_PAYLOAD_BAKEOFF = True   # Export one mosaic per payload decode mode
-ENABLE_EXTRA_PAYLOAD_BAKEOFF = True  # Include offset-shifted payload modes in bakeoff
+ENABLE_PAYLOAD_BAKEOFF = False   # Export one mosaic per payload decode mode
+ENABLE_EXTRA_PAYLOAD_BAKEOFF = False  # Include offset-shifted payload modes in bakeoff
 
 # Side-specific sample ordering
-REVERSE_PORT_SAMPLES = True      # Port often stores samples in opposite range order
+REVERSE_PORT_SAMPLES = False      # Locked from successful channel bakeoff (revF)
 REVERSE_STARBOARD_SAMPLES = False
+PORT_HEADING_OFFSET_DEG = 0.0    # Additional heading correction per side
+STARBOARD_HEADING_OFFSET_DEG = 0.0
+ENABLE_PORT_ORIENTATION_BAKEOFF = False  # Test port orientation flips
+ENABLE_PORT_SHIFT_BAKEOFF = False        # Test likely tail-byte offsets for port payload
+ENABLE_PORT_SOURCE_BAKEOFF = False       # Test son_offset-anchored payload extraction
+ENABLE_PORT_RAW_BAKEOFF = False           # Raw-bin diagnostic without slant/TVG/EGN
+PORT_RAW_BIN_SIZE_M = 0.02               # Range bin size for raw diagnostic georeferencing
+ENABLE_PORT_CHANNEL_BAKEOFF = False       # Build port candidates from global metadata channels
+PORT_CHANNEL_IDS = [1, 2, 3]             # Candidate channel IDs to test as true port source
+PORT_CHANNEL_MODE = "u8_odd"             # Payload mode for channel-source bakeoff ("auto" or mode)
+USE_PORT_CHANNEL_OVERRIDE = True         # Use channel override for normal port processing
+PORT_CHANNEL_OVERRIDE_ID = 1             # Winning channel from bakeoff
 
 # EGN stabilization
 EGN_SMOOTH_WINDOW = 250       # Smoothing width for beam-pattern estimate
@@ -505,7 +526,7 @@ def read_ping_record(rsd_handle, file_size, offset, data_size, next_offset):
     return rsd_handle.read(read_len)
 
 
-def extract_payload_candidates(record_data, sample_count):
+def extract_payload_candidates(record_data, sample_count, son_offset=None):
     """
     Build candidate payload interpretations from the tail of a variable-length record.
     """
@@ -525,6 +546,9 @@ def extract_payload_candidates(record_data, sample_count):
         if end >= n:
             tail_u8 = np.frombuffer(record_data[end - n:end], dtype=np.uint8).astype(np.float32)
             candidates[f"u8_tail{suffix}"] = tail_u8
+            # Some channels encode useful intensity only in one nibble.
+            candidates[f"u8_tail_hi4{suffix}"] = np.floor(tail_u8 / 16.0) * 17.0
+            candidates[f"u8_tail_lo4{suffix}"] = np.mod(tail_u8, 16.0) * 17.0
 
         if end >= (2 * n):
             tail_2n = record_data[end - 2 * n:end]
@@ -534,6 +558,10 @@ def extract_payload_candidates(record_data, sample_count):
 
             candidates[f"u8_even{suffix}"] = raw_u8[0::2].astype(np.float32)
             candidates[f"u8_odd{suffix}"] = raw_u8[1::2].astype(np.float32)
+            candidates[f"u8_even_hi4{suffix}"] = np.floor(raw_u8[0::2].astype(np.float32) / 16.0) * 17.0
+            candidates[f"u8_even_lo4{suffix}"] = np.mod(raw_u8[0::2].astype(np.float32), 16.0) * 17.0
+            candidates[f"u8_odd_hi4{suffix}"] = np.floor(raw_u8[1::2].astype(np.float32) / 16.0) * 17.0
+            candidates[f"u8_odd_lo4{suffix}"] = np.mod(raw_u8[1::2].astype(np.float32), 16.0) * 17.0
             candidates[f"u16_le{suffix}"] = u16_le.astype(np.float32)
             candidates[f"u16_be{suffix}"] = u16_be.astype(np.float32)
 
@@ -542,9 +570,33 @@ def extract_payload_candidates(record_data, sample_count):
                 candidates["u16_le_hi"] = ((u16_le >> 8) & 0xFF).astype(np.float32)
                 candidates["u16_le_lo"] = (u16_le & 0xFF).astype(np.float32)
 
+    def add_anchored(start, prefix):
+        if start is None or start < 0:
+            return
+        if len(record_data) >= (start + n):
+            start_u8 = np.frombuffer(record_data[start:start + n], dtype=np.uint8).astype(np.float32)
+            candidates[f"{prefix}_u8"] = start_u8
+            candidates[f"{prefix}_u8_hi4"] = np.floor(start_u8 / 16.0) * 17.0
+            candidates[f"{prefix}_u8_lo4"] = np.mod(start_u8, 16.0) * 17.0
+        if len(record_data) >= (start + 2 * n):
+            block = record_data[start:start + 2 * n]
+            raw_u8 = np.frombuffer(block, dtype=np.uint8)
+            candidates[f"{prefix}_even"] = raw_u8[0::2].astype(np.float32)
+            candidates[f"{prefix}_odd"] = raw_u8[1::2].astype(np.float32)
+            candidates[f"{prefix}_even_hi4"] = np.floor(raw_u8[0::2].astype(np.float32) / 16.0) * 17.0
+            candidates[f"{prefix}_even_lo4"] = np.mod(raw_u8[0::2].astype(np.float32), 16.0) * 17.0
+            candidates[f"{prefix}_odd_hi4"] = np.floor(raw_u8[1::2].astype(np.float32) / 16.0) * 17.0
+            candidates[f"{prefix}_odd_lo4"] = np.mod(raw_u8[1::2].astype(np.float32), 16.0) * 17.0
+            candidates[f"{prefix}_u16_le"] = np.frombuffer(block, dtype="<u2").astype(np.float32)
+            candidates[f"{prefix}_u16_be"] = np.frombuffer(block, dtype=">u2").astype(np.float32)
+
     add_shifted(0)
     add_shifted(16)
+    add_shifted(23)
+    add_shifted(24)
     add_shifted(32)
+    if son_offset is not None:
+        add_anchored(int(son_offset), "son")
 
     return candidates
 
@@ -618,7 +670,8 @@ def choose_payload_mode(rsd_handle, meta_df, next_offsets, file_size, side_name)
         if len(record_data) < 32:
             continue
 
-        candidates = extract_payload_candidates(record_data, n_samples)
+        son_offset = int(row['son_offset']) if ('son_offset' in meta_df.columns and pd.notna(row.get('son_offset'))) else None
+        candidates = extract_payload_candidates(record_data, n_samples, son_offset=son_offset)
 
         for mode, arr in candidates.items():
             if mode not in mode_scores:
@@ -669,7 +722,7 @@ def extract_nav_point(row):
 
 
 def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload_mode_override="auto",
-                 reverse_samples=False):
+                 reverse_samples=False, heading_offset_deg=0.0):
     """
     Reads and processes one side (port or starboard) of sidescan data.
 
@@ -736,7 +789,8 @@ def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload
             else:
                 n_samples = FALLBACK_SAMPLE_COUNT
 
-            candidates = extract_payload_candidates(record_data, n_samples)
+            son_offset = int(row['son_offset']) if ('son_offset' in meta_df.columns and pd.notna(row.get('son_offset'))) else None
+            candidates = extract_payload_candidates(record_data, n_samples, son_offset=son_offset)
             raw_intensities = candidates.get(payload_mode)
             if raw_intensities is None and candidates:
                 # Fallback to first available mode for this ping if chosen mode is unavailable.
@@ -755,6 +809,16 @@ def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload
                 ping_max_range = float(row['max_range'])
             else:
                 ping_max_range = MAX_RANGE_FALLBACK
+
+            # Channel-override port often reports shorter range metadata than true SS swath.
+            if sign < 0 and PORT_MAX_RANGE_OVERRIDE_M is not None:
+                ping_max_range = float(PORT_MAX_RANGE_OVERRIDE_M)
+
+            if sign < 0:
+                ping_max_range *= PORT_RANGE_SCALE
+            else:
+                ping_max_range *= STARBOARD_RANGE_SCALE
+
             if ping_max_range <= 0:
                 continue
 
@@ -781,7 +845,8 @@ def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload
                     skipped_no_nav += 1
                     continue
                 waterfall_rows.append(corrected)
-                nav_data.append(nav_point)
+                x_nav, y_nav, h_nav = nav_point
+                nav_data.append((x_nav, y_nav, (h_nav + heading_offset_deg) % 360.0))
 
         except Exception:
             continue
@@ -838,6 +903,107 @@ def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload
     texture_img = calculate_texture(waterfall, TEXTURE_WINDOW_SIZE)
 
     return waterfall, texture_img, nav_data, 1 if sign == 1 else -1
+
+
+def process_side_raw_diagnostic(rsd_handle, meta_df, side_name, sign, transformer=None,
+                                payload_mode_override="auto", reverse_samples=False,
+                                heading_offset_deg=0.0):
+    """
+    Decode and georeference raw samples without TVG/slant/EGN/filtering.
+    Useful to diagnose channel packing/order independently of processing pipeline.
+    """
+    print(f"\n--- Raw Diagnostic {side_name} Side ---")
+
+    waterfall_rows = []
+    nav_data = []
+    meta_df = meta_df.reset_index(drop=True)
+    next_offsets = compute_next_offsets(meta_df)
+    file_size = os.path.getsize(RSD_FILE)
+
+    has_speed = 'speed_ms' in meta_df.columns
+    has_ping_cnt = 'ping_cnt' in meta_df.columns
+
+    if payload_mode_override and payload_mode_override != "auto":
+        payload_mode = payload_mode_override
+        print(f"  Forced payload mode for {side_name}: {payload_mode}")
+    else:
+        payload_mode = choose_payload_mode(rsd_handle, meta_df, next_offsets, file_size, side_name)
+
+    skipped_slow = 0
+    skipped_no_nav = 0
+    skipped_decode = 0
+
+    for idx, row in tqdm(meta_df.iterrows(), total=len(meta_df), desc="RawRead"):
+        if pd.isna(row['index']) or pd.isna(row['data_size']):
+            continue
+        offset = int(row['index'])
+        if offset >= file_size:
+            continue
+
+        if has_speed and MIN_SPEED_MS > 0:
+            speed = row['speed_ms']
+            if pd.notna(speed) and speed < MIN_SPEED_MS:
+                skipped_slow += 1
+                continue
+
+        try:
+            body_size = int(row['data_size'])
+            next_off = next_offsets[idx]
+            record_data = read_ping_record(rsd_handle, file_size, offset, body_size, next_off)
+            if len(record_data) < 32:
+                continue
+
+            if has_ping_cnt and pd.notna(row['ping_cnt']) and row['ping_cnt'] > 0:
+                n_samples = int(row['ping_cnt'])
+            else:
+                n_samples = FALLBACK_SAMPLE_COUNT
+
+            son_offset = int(row['son_offset']) if ('son_offset' in meta_df.columns and pd.notna(row.get('son_offset'))) else None
+            candidates = extract_payload_candidates(record_data, n_samples, son_offset=son_offset)
+            raw_intensities = candidates.get(payload_mode)
+            if raw_intensities is None and candidates:
+                raw_intensities = next(iter(candidates.values()))
+            if raw_intensities is None or len(raw_intensities) == 0:
+                skipped_decode += 1
+                continue
+
+            if reverse_samples:
+                raw_intensities = raw_intensities[::-1].copy()
+
+            nav_point = extract_nav_point(row)
+            if nav_point is None:
+                skipped_no_nav += 1
+                continue
+
+            # Raw diagnostic keeps native sample structure; only cast for raster accumulation.
+            waterfall_rows.append(raw_intensities.astype(np.float32))
+            x_nav, y_nav, h_nav = nav_point
+            nav_data.append((x_nav, y_nav, (h_nav + heading_offset_deg) % 360.0))
+        except Exception:
+            continue
+
+    if skipped_slow > 0:
+        print(f"  Skipped {skipped_slow} near-stationary pings (speed < {MIN_SPEED_MS} m/s)")
+    if skipped_no_nav > 0:
+        print(f"  Skipped {skipped_no_nav} pings with missing navigation")
+    if skipped_decode > 0:
+        print(f"  Skipped {skipped_decode} pings that could not decode payload")
+
+    if not waterfall_rows:
+        print("  No valid raw data found.")
+        return None, None, None, None
+
+    if len(nav_data) != len(waterfall_rows):
+        aligned_len = min(len(nav_data), len(waterfall_rows))
+        nav_data = nav_data[:aligned_len]
+        waterfall_rows = waterfall_rows[:aligned_len]
+
+    max_len = max(len(r) for r in waterfall_rows)
+    waterfall = np.zeros((len(waterfall_rows), max_len), dtype=np.float32)
+    for i, r in enumerate(waterfall_rows):
+        waterfall[i, :len(r)] = r
+
+    return waterfall, None, nav_data, 1 if sign == 1 else -1
 
 
 def percentile_stretch(data, low_pct=2, high_pct=98):
@@ -1137,11 +1303,11 @@ def run_payload_bakeoff(rsd_file, ss_port, ss_star, output_dir, output_resolutio
         with open(rsd_file, 'rb') as f:
             wf_p, _, nav_p, _ = process_side(
                 f, ss_port, "Port", -1, transformer=transformer, payload_mode_override=mode,
-                reverse_samples=REVERSE_PORT_SAMPLES
+                reverse_samples=REVERSE_PORT_SAMPLES, heading_offset_deg=PORT_HEADING_OFFSET_DEG
             )
             wf_s, _, nav_s, _ = process_side(
                 f, ss_star, "Starboard", 1, transformer=transformer, payload_mode_override=mode,
-                reverse_samples=REVERSE_STARBOARD_SAMPLES
+                reverse_samples=REVERSE_STARBOARD_SAMPLES, heading_offset_deg=STARBOARD_HEADING_OFFSET_DEG
             )
 
         bakeoff_file = os.path.join(bakeoff_dir, f"intensity_{mode}.tif")
@@ -1154,6 +1320,193 @@ def run_payload_bakeoff(rsd_file, ss_port, ss_star, output_dir, output_resolutio
         )
 
     print("  Bakeoff complete.")
+
+
+def run_port_orientation_bakeoff(rsd_file, ss_port, output_dir, output_resolution,
+                                 output_crs=None, transformer=None, coord_type='projected'):
+    """
+    Test port orientation variants for fixed payload mode.
+    """
+    orient_dir = os.path.join(output_dir, "port_orientation_bakeoff")
+    os.makedirs(orient_dir, exist_ok=True)
+    print("\n--- Port Orientation Bakeoff ---")
+    print(f"  Writing orientation mosaics to: {orient_dir}")
+
+    mode_transformer = transformer if coord_type == 'geographic' else None
+    base_mode = PAYLOAD_MODE_OVERRIDE_PORT
+    if base_mode == "auto":
+        base_mode = "u8_odd"
+
+    combos = [
+        ("revT_h0", True, 0.0),
+        ("revF_h0", False, 0.0),
+        ("revT_h180", True, 180.0),
+        ("revF_h180", False, 180.0),
+    ]
+
+    for label, rev_samples, heading_off in combos:
+        print(f"\n  >>> Port orientation: {label} mode={base_mode}")
+        with open(rsd_file, 'rb') as f:
+            wf_p, _, nav_p, sign_p = process_side(
+                f, ss_port, "Port", -1, transformer=transformer,
+                payload_mode_override=base_mode,
+                reverse_samples=rev_samples,
+                heading_offset_deg=heading_off,
+            )
+        out_file = os.path.join(orient_dir, f"port_{base_mode}_{label}.tif")
+        save_geotiff(
+            wf_p, nav_p, sign_p, output_resolution, out_file,
+            raster_crs=output_crs,
+            transformer=mode_transformer,
+        )
+
+    print("  Port orientation bakeoff complete.")
+
+
+def run_port_shift_bakeoff(rsd_file, ss_port, output_dir, output_resolution,
+                           output_crs=None, transformer=None, coord_type='projected'):
+    """
+    Test likely tail-shift offsets for the port payload decode.
+    """
+    shift_dir = os.path.join(output_dir, "port_shift_bakeoff")
+    os.makedirs(shift_dir, exist_ok=True)
+    print("\n--- Port Shift Bakeoff ---")
+    print(f"  Writing shift mosaics to: {shift_dir}")
+
+    mode_transformer = transformer if coord_type == 'geographic' else None
+    modes = ["u8_odd", "u8_odd_s16", "u8_odd_s23", "u8_odd_s24", "u8_odd_s32"]
+
+    for mode in modes:
+        print(f"\n  >>> Port shift mode: {mode}")
+        with open(rsd_file, 'rb') as f:
+            wf_p, _, nav_p, sign_p = process_side(
+                f, ss_port, "Port", -1, transformer=transformer,
+                payload_mode_override=mode,
+                reverse_samples=REVERSE_PORT_SAMPLES,
+                heading_offset_deg=PORT_HEADING_OFFSET_DEG,
+            )
+        out_file = os.path.join(shift_dir, f"port_{mode}.tif")
+        save_geotiff(
+            wf_p, nav_p, sign_p, output_resolution, out_file,
+            raster_crs=output_crs,
+            transformer=mode_transformer,
+        )
+
+    print("  Port shift bakeoff complete.")
+
+
+def run_port_source_bakeoff(rsd_file, ss_port, output_dir, output_resolution,
+                            output_crs=None, transformer=None, coord_type='projected'):
+    """
+    Compare tail-based and son_offset-anchored payload extraction modes for port.
+    """
+    src_dir = os.path.join(output_dir, "port_source_bakeoff")
+    os.makedirs(src_dir, exist_ok=True)
+    print("\n--- Port Source Bakeoff ---")
+    print(f"  Writing source mosaics to: {src_dir}")
+
+    mode_transformer = transformer if coord_type == 'geographic' else None
+    modes = ["u8_odd", "son_odd", "son_even", "son_u8", "son_u16_le", "son_u16_be"]
+
+    for mode in modes:
+        print(f"\n  >>> Port source mode: {mode}")
+        with open(rsd_file, 'rb') as f:
+            wf_p, _, nav_p, sign_p = process_side(
+                f, ss_port, "Port", -1, transformer=transformer,
+                payload_mode_override=mode,
+                reverse_samples=REVERSE_PORT_SAMPLES,
+                heading_offset_deg=PORT_HEADING_OFFSET_DEG,
+            )
+        out_file = os.path.join(src_dir, f"port_{mode}.tif")
+        save_geotiff(
+            wf_p, nav_p, sign_p, output_resolution, out_file,
+            raster_crs=output_crs,
+            transformer=mode_transformer,
+        )
+
+    print("  Port source bakeoff complete.")
+
+
+def run_port_raw_bakeoff(rsd_file, ss_port, output_dir, output_crs=None, transformer=None,
+                         coord_type='projected'):
+    """
+    Port-only raw decode bakeoff to isolate payload packing/order issues.
+    """
+    raw_dir = os.path.join(output_dir, "port_raw_bakeoff")
+    os.makedirs(raw_dir, exist_ok=True)
+    print("\n--- Port Raw Diagnostic Bakeoff ---")
+    print(f"  Writing raw diagnostic mosaics to: {raw_dir}")
+
+    mode_transformer = transformer if coord_type == 'geographic' else None
+    modes = [
+        "u8_odd", "u8_even", "u8_odd_hi4", "u8_odd_lo4",
+        "son_odd", "son_even", "son_odd_hi4", "son_odd_lo4",
+        "son_u8", "son_u8_hi4", "son_u8_lo4",
+    ]
+
+    for mode in modes:
+        print(f"\n  >>> Port raw mode: {mode}")
+        with open(rsd_file, 'rb') as f:
+            wf_p, _, nav_p, sign_p = process_side_raw_diagnostic(
+                f, ss_port, "Port", -1, transformer=transformer,
+                payload_mode_override=mode,
+                reverse_samples=REVERSE_PORT_SAMPLES,
+                heading_offset_deg=PORT_HEADING_OFFSET_DEG,
+            )
+        out_file = os.path.join(raw_dir, f"port_raw_{mode}.tif")
+        save_geotiff(
+            wf_p, nav_p, sign_p, PORT_RAW_BIN_SIZE_M, out_file,
+            raster_crs=output_crs,
+            transformer=mode_transformer,
+        )
+
+    print("  Port raw diagnostic bakeoff complete.")
+
+
+def run_port_channel_bakeoff(rsd_file, all_meta_file, output_dir, output_resolution,
+                             output_crs=None, transformer=None, coord_type='projected'):
+    """
+    Build alternate port candidates from global metadata channels.
+    """
+    if not os.path.exists(all_meta_file):
+        print(f"\n--- Port Channel Bakeoff ---")
+        print(f"  Global metadata missing: {all_meta_file}")
+        return
+
+    ch_dir = os.path.join(output_dir, "port_channel_bakeoff")
+    os.makedirs(ch_dir, exist_ok=True)
+
+    print("\n--- Port Channel Bakeoff ---")
+    print(f"  Source: {all_meta_file}")
+    print(f"  Writing channel mosaics to: {ch_dir}")
+
+    all_meta = pd.read_csv(all_meta_file)
+    mode_transformer = transformer if coord_type == 'geographic' else None
+
+    for ch_id in PORT_CHANNEL_IDS:
+        ch_df = all_meta[pd.to_numeric(all_meta.get('channel_id'), errors='coerce') == float(ch_id)].copy()
+        ch_df = ch_df.reset_index(drop=True)
+        if len(ch_df) == 0:
+            continue
+
+        for rev in [False, True]:
+            label = f"ch{int(ch_id)}_rev{'T' if rev else 'F'}"
+            print(f"\n  >>> Port channel candidate: {label} mode={PORT_CHANNEL_MODE}")
+            with open(rsd_file, 'rb') as f:
+                wf_p, _, nav_p, sign_p = process_side(
+                    f, ch_df, f"PortCandidate-{label}", -1, transformer=transformer,
+                    payload_mode_override=PORT_CHANNEL_MODE,
+                    reverse_samples=rev,
+                    heading_offset_deg=PORT_HEADING_OFFSET_DEG,
+                )
+            out_file = os.path.join(ch_dir, f"port_{PORT_CHANNEL_MODE}_{label}.tif")
+            save_geotiff(
+                wf_p, nav_p, sign_p, output_resolution, out_file,
+                raster_crs=output_crs,
+                transformer=mode_transformer,
+            )
+
+    print("  Port channel bakeoff complete.")
 
 
 # === Execution ===
@@ -1172,11 +1525,19 @@ if __name__ == "__main__":
     print(f"  Min speed:   {MIN_SPEED_MS} m/s")
     print(f"  Stretch:     {STRETCH_LOW_PCT}-{STRETCH_HIGH_PCT} percentile")
     print(f"  Log comp:    {APPLY_LOG_COMPRESSION} (scale={LOG_COMPRESSION_SCALE})")
+    print(f"  Range cfg:   fallback={MAX_RANGE_FALLBACK}m, port_override={PORT_MAX_RANGE_OVERRIDE_M}, scales P/S={PORT_RANGE_SCALE}/{STARBOARD_RANGE_SCALE}")
     print(f"  Row balance: {APPLY_ROW_BALANCE}")
     print(f"  Payload mode:{PAYLOAD_MODE_OVERRIDE_PORT} (port), {PAYLOAD_MODE_OVERRIDE_STARBOARD} (starboard)")
     print(f"  Reverse samp:{REVERSE_PORT_SAMPLES} (port), {REVERSE_STARBOARD_SAMPLES} (starboard)")
+    print(f"  Heading off: {PORT_HEADING_OFFSET_DEG} (port), {STARBOARD_HEADING_OFFSET_DEG} (starboard)")
     print(f"  Bakeoff:     {ENABLE_PAYLOAD_BAKEOFF}")
     print(f"  Bakeoff ext: {ENABLE_EXTRA_PAYLOAD_BAKEOFF}")
+    print(f"  Port orient: {ENABLE_PORT_ORIENTATION_BAKEOFF}")
+    print(f"  Port shift:  {ENABLE_PORT_SHIFT_BAKEOFF}")
+    print(f"  Port source: {ENABLE_PORT_SOURCE_BAKEOFF}")
+    print(f"  Port raw:    {ENABLE_PORT_RAW_BAKEOFF} (bin={PORT_RAW_BIN_SIZE_M}m)")
+    print(f"  Port ch src: {ENABLE_PORT_CHANNEL_BAKEOFF} (channels={PORT_CHANNEL_IDS}, mode={PORT_CHANNEL_MODE})")
+    print(f"  Port ch use: {USE_PORT_CHANNEL_OVERRIDE} (channel={PORT_CHANNEL_OVERRIDE_ID})")
     print()
 
     # Ensure metadata exists
@@ -1189,6 +1550,17 @@ if __name__ == "__main__":
     print("Loading metadata...")
     ss_port = pd.read_csv(os.path.join(META_DIR, "B002_ss_port_meta.csv"))
     ss_star = pd.read_csv(os.path.join(META_DIR, "B003_ss_star_meta.csv"))
+
+    if USE_PORT_CHANNEL_OVERRIDE and os.path.exists(ALL_META_FILE):
+        all_meta = pd.read_csv(ALL_META_FILE)
+        channel_vals = pd.to_numeric(all_meta.get('channel_id'), errors='coerce')
+        ss_port_alt = all_meta[channel_vals == float(PORT_CHANNEL_OVERRIDE_ID)].copy()
+        ss_port_alt = ss_port_alt.reset_index(drop=True)
+        if len(ss_port_alt) > 0:
+            ss_port = ss_port_alt
+            print(f"  Port source override: channel_id={PORT_CHANNEL_OVERRIDE_ID} from All-Garmin-Sonar-MetaData.csv")
+        else:
+            print(f"  WARNING: Port channel override {PORT_CHANNEL_OVERRIDE_ID} had no rows; using default B002 metadata")
 
     # Detect coordinate type and auto-determine UTM CRS
     coord_type = 'projected'
@@ -1232,6 +1604,55 @@ if __name__ == "__main__":
             transformer=transformer,
             coord_type=coord_type,
         )
+    if ENABLE_PORT_ORIENTATION_BAKEOFF:
+        run_port_orientation_bakeoff(
+            RSD_FILE,
+            ss_port,
+            OUTPUT_DIR,
+            OUTPUT_RESOLUTION,
+            output_crs=output_crs,
+            transformer=transformer,
+            coord_type=coord_type,
+        )
+    if ENABLE_PORT_SHIFT_BAKEOFF:
+        run_port_shift_bakeoff(
+            RSD_FILE,
+            ss_port,
+            OUTPUT_DIR,
+            OUTPUT_RESOLUTION,
+            output_crs=output_crs,
+            transformer=transformer,
+            coord_type=coord_type,
+        )
+    if ENABLE_PORT_SOURCE_BAKEOFF:
+        run_port_source_bakeoff(
+            RSD_FILE,
+            ss_port,
+            OUTPUT_DIR,
+            OUTPUT_RESOLUTION,
+            output_crs=output_crs,
+            transformer=transformer,
+            coord_type=coord_type,
+        )
+    if ENABLE_PORT_RAW_BAKEOFF:
+        run_port_raw_bakeoff(
+            RSD_FILE,
+            ss_port,
+            OUTPUT_DIR,
+            output_crs=output_crs,
+            transformer=transformer,
+            coord_type=coord_type,
+        )
+    if ENABLE_PORT_CHANNEL_BAKEOFF:
+        run_port_channel_bakeoff(
+            RSD_FILE,
+            ALL_META_FILE,
+            OUTPUT_DIR,
+            OUTPUT_RESOLUTION,
+            output_crs=output_crs,
+            transformer=transformer,
+            coord_type=coord_type,
+        )
 
     with open(RSD_FILE, 'rb') as f:
         # Process both sides
@@ -1239,11 +1660,13 @@ if __name__ == "__main__":
             f, ss_port, "Port", -1, transformer=transformer,
             payload_mode_override=PAYLOAD_MODE_OVERRIDE_PORT,
             reverse_samples=REVERSE_PORT_SAMPLES,
+            heading_offset_deg=PORT_HEADING_OFFSET_DEG,
         )
         wf_s, tex_s, nav_s, sign_s = process_side(
             f, ss_star, "Starboard", 1, transformer=transformer,
             payload_mode_override=PAYLOAD_MODE_OVERRIDE_STARBOARD,
             reverse_samples=REVERSE_STARBOARD_SAMPLES,
+            heading_offset_deg=STARBOARD_HEADING_OFFSET_DEG,
         )
 
     # Save individual side GeoTIFFs
