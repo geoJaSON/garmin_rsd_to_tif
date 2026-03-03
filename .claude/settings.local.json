@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show pingverter)",
+      "Bash(pip3 show pingverter)",
+      "Bash(python3 -c \":*)",
+      "Bash(/c/Users/jason/miniforge3/python.exe -c \":*)",
+      "Bash(python -c \":*)",
+      "Bash(/c/Users/jason/miniforge3/envs/geo_env/python.exe -c \":*)"
+    ]
+  }
+}

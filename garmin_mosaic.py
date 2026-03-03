@@ -30,6 +30,79 @@ from tqdm import tqdm
 from pyproj import CRS, Transformer
 
 
+# === Configuration ===
+RSD_FILE = r"C:\Users\jason\Downloads\Side.RSD"
+
+RSD_BASENAME = os.path.splitext(os.path.basename(RSD_FILE))[0]
+RSD_PARENT_DIR = os.path.dirname(RSD_FILE)
+OUTPUT_BASE_DIR = os.path.join(RSD_PARENT_DIR, f"garmin_output_{RSD_BASENAME}")
+META_DIR = os.path.join(OUTPUT_BASE_DIR, "meta")
+OUTPUT_DIR = os.path.join(OUTPUT_BASE_DIR, "processed")
+
+# Processing Parameters
+OUTPUT_RESOLUTION = 0.05    # 5cm per pixel
+TEXTURE_WINDOW_SIZE = 15    # Texture analysis window (~1.5m at 5cm res)
+MAX_RANGE_FALLBACK = 15.0   # Fallback if per-ping max_range not in metadata
+
+# Radiometric Corrections
+APPLY_TVG = True
+TVG_SPREADING_DB = 30.0     # Spreading loss compensation (20-40 dB typical for sidescan)
+ABSORPTION_COEFF = 0.05     # dB/m (0.03-0.06 freshwater, 0.1-0.2 seawater at 455kHz)
+APPLY_DESPECKLE = True
+DESPECKLE_SIZE = 3           # Median filter kernel (3x3)
+APPLY_LEE_FILTER = True      # Adaptive speckle suppression on waterfall
+LEE_WINDOW_SIZE = 7          # Local window size for Lee filter
+
+# Navigation
+HEADING_SMOOTH_WINDOW = 100  # Heading smoothing window (pings)
+FILTER_OUTLIERS = False      # Remove heading/position outlier pings
+MIN_SPEED_MS = 0.3           # Skip pings below this speed (m/s), 0 to disable
+
+# Gap filling
+FILL_GAPS = True
+MAX_FILL_DISTANCE = 2.0     # Max interpolation distance between pings (meters)
+
+# Nadir zone
+NADIR_MASK_BINS = 12         # Zero out first N ground-range bins (nadir artifact)
+NADIR_ALTITUDE_FACTOR = 0.75  # Extra nadir mask from altitude: bins = altitude*factor/resolution
+
+# Raster gap fill (post-processing to close single-pixel gaps from scan line divergence)
+GAP_FILL_PASSES = 3          # Iterative neighbor-mean fill passes (0 to disable, 2-3 typical)
+
+# Contrast stretch
+STRETCH_LOW_PCT = 2          # Lower percentile for output contrast stretch
+STRETCH_HIGH_PCT = 98        # Upper percentile for output contrast stretch
+APPLY_LOG_COMPRESSION = True  # Log-compress before percentile stretch
+LOG_COMPRESSION_SCALE = 6.0   # Higher = stronger highlight compression
+
+# Record/payload decoding
+PAYLOAD_PROBE_PINGS = 150     # Number of pings used to auto-select payload decoding mode
+FALLBACK_SAMPLE_COUNT = 2048  # Fallback sample count when metadata ping_cnt is missing
+PAYLOAD_MODES = ["u8_tail", "u8_even", "u8_odd", "u16_le", "u16_be", "u16_le_hi", "u16_le_lo"]
+PAYLOAD_EXTRA_MODES = [
+    "u8_tail_s16", "u8_even_s16", "u8_odd_s16", "u16_le_s16", "u16_be_s16",
+    "u8_tail_s32", "u8_even_s32", "u8_odd_s32", "u16_le_s32", "u16_be_s32",
+]
+PAYLOAD_MODE_OVERRIDE_PORT = "u8_odd"       # "auto" or one of PAYLOAD_MODES
+PAYLOAD_MODE_OVERRIDE_STARBOARD = "u8_odd"  # "auto" or one of PAYLOAD_MODES
+ENABLE_PAYLOAD_BAKEOFF = True   # Export one mosaic per payload decode mode
+ENABLE_EXTRA_PAYLOAD_BAKEOFF = True  # Include offset-shifted payload modes in bakeoff
+
+# Side-specific sample ordering
+REVERSE_PORT_SAMPLES = True      # Port often stores samples in opposite range order
+REVERSE_STARBOARD_SAMPLES = False
+
+# EGN stabilization
+EGN_SMOOTH_WINDOW = 250       # Smoothing width for beam-pattern estimate
+EGN_GAIN_MIN = 0.45           # Prevent over-darkening
+EGN_GAIN_MAX = 2.20           # Prevent noise amplification
+
+# Ping-to-ping leveling
+APPLY_ROW_BALANCE = True      # Remove ping gain jitter before EGN
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
 # === Metadata Generation ===
 def ensure_metadata_exists(rsd_file, meta_dir, force_regenerate=False):
     """
@@ -79,49 +152,6 @@ def ensure_metadata_exists(rsd_file, meta_dir, force_regenerate=False):
         return False
 
 
-# === Configuration ===
-RSD_FILE = r"C:\Users\jason\Downloads\Side.RSD"
-
-RSD_BASENAME = os.path.splitext(os.path.basename(RSD_FILE))[0]
-RSD_PARENT_DIR = os.path.dirname(RSD_FILE)
-OUTPUT_BASE_DIR = os.path.join(RSD_PARENT_DIR, f"garmin_output_{RSD_BASENAME}")
-META_DIR = os.path.join(OUTPUT_BASE_DIR, "meta")
-OUTPUT_DIR = os.path.join(OUTPUT_BASE_DIR, "processed")
-
-# Processing Parameters
-OUTPUT_RESOLUTION = 0.05    # 5cm per pixel
-TEXTURE_WINDOW_SIZE = 15    # Texture analysis window (~1.5m at 5cm res)
-MAX_RANGE_FALLBACK = 30.0   # Fallback if per-ping max_range not in metadata
-
-# Radiometric Corrections
-APPLY_TVG = True
-TVG_SPREADING_DB = 30.0     # Spreading loss compensation (20-40 dB typical for sidescan)
-ABSORPTION_COEFF = 0.05     # dB/m (0.03-0.06 freshwater, 0.1-0.2 seawater at 455kHz)
-APPLY_DESPECKLE = True
-DESPECKLE_SIZE = 3           # Median filter kernel (3x3)
-
-# Navigation
-HEADING_SMOOTH_WINDOW = 100  # Heading smoothing window (pings)
-FILTER_OUTLIERS = False      # Remove heading/position outlier pings
-MIN_SPEED_MS = 0.3           # Skip pings below this speed (m/s), 0 to disable
-
-# Gap filling
-FILL_GAPS = True
-MAX_FILL_DISTANCE = 2.0     # Max interpolation distance between pings (meters)
-
-# Nadir zone
-NADIR_MASK_BINS = 5          # Zero out first N ground-range bins (nadir artifact)
-
-# Raster gap fill (post-processing to close single-pixel gaps from scan line divergence)
-GAP_FILL_PASSES = 3          # Iterative neighbor-mean fill passes (0 to disable, 2-3 typical)
-
-# Contrast stretch
-STRETCH_LOW_PCT = 2          # Lower percentile for output contrast stretch
-STRETCH_HIGH_PCT = 98        # Upper percentile for output contrast stretch
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-
 # === Processing Functions ===
 
 def apply_tvg_correction(intensities, slant_ranges_m, tvg_db=30.0, absorption=0.05):
@@ -155,7 +185,8 @@ def slant_range_correction(intensities, altitude_m, max_range_m, res_m, nadir_ma
     """
     Converts slant range (time) to ground range (distance).
     Removes water column and corrects geometric distortion.
-    Masks nadir zone bins where the correction is most unstable.
+    Uses binned averaging (anti-aliasing) instead of naive linear interpolation
+    to prevent "static TV" noise when heavily downsampling acoustic samples to grid cells.
     Returns float32.
     """
     n_samples = len(intensities)
@@ -170,26 +201,52 @@ def slant_range_correction(intensities, altitude_m, max_range_m, res_m, nadir_ma
         return np.array([], dtype=np.float32)
 
     # Ground range: Rg = sqrt(Rs^2 - H^2)
-    ground_ranges = np.sqrt(slant_ranges[valid_mask] ** 2 - altitude_m ** 2)
+    sr_valid = slant_ranges[valid_mask]
+    ground_ranges = np.sqrt(sr_valid ** 2 - altitude_m ** 2)
     valid_intensities = intensities[valid_mask]
 
     if len(ground_ranges) < 2:
         return np.array([], dtype=np.float32)
 
-    max_ground_range = np.max(ground_ranges)
-    grid_samples = int(max_ground_range / res_m)
-    if grid_samples == 0:
+    max_bin = int(max_range_m / res_m)
+    if max_bin == 0:
         return np.zeros(1, dtype=np.float32)
 
-    grid_ranges = np.linspace(0, max_ground_range, grid_samples)
+    # Map each valid ground range to its grid bin
+    bins = (ground_ranges / res_m).astype(np.int32)
+    
+    valid_bins = bins[bins < max_bin]
+    valid_vals = valid_intensities[bins < max_bin]
 
-    f = interp1d(ground_ranges, valid_intensities, kind='linear',
-                 bounds_error=False, fill_value=0)
-    corrected_line = f(grid_ranges).astype(np.float32)
+    if len(valid_bins) == 0:
+        return np.zeros(max_bin, dtype=np.float32)
+
+    # Fast averaging of all acoustic samples that fall within pixel width
+    counts = np.bincount(valid_bins, minlength=max_bin)[:max_bin]
+    sums = np.bincount(valid_bins, weights=valid_vals, minlength=max_bin)[:max_bin]
+
+    corrected_line = np.zeros(max_bin, dtype=np.float32)
+    mask = counts > 0
+    corrected_line[mask] = sums[mask] / counts[mask]
+
+    # Fill empty bins using linear interpolation from neighbors
+    empty = ~mask
+    if np.any(empty) and np.any(mask):
+        valid_indices = np.flatnonzero(mask)
+        empty_indices = np.flatnonzero(empty)
+        # only interpolate within the min-max valid range
+        min_idx, max_idx = valid_indices[0], valid_indices[-1]
+        empty_to_fill = empty_indices[(empty_indices > min_idx) & (empty_indices < max_idx)]
+        if len(empty_to_fill) > 0:
+            corrected_line[empty_to_fill] = np.interp(
+                empty_to_fill, valid_indices, corrected_line[valid_indices]
+            )
 
     # Mask nadir zone (first few bins are geometrically unstable)
-    if nadir_mask_bins > 0 and len(corrected_line) > nadir_mask_bins:
-        corrected_line[:nadir_mask_bins] = 0
+    dynamic_nadir = int((max(0.0, altitude_m) * NADIR_ALTITUDE_FACTOR) / max(res_m, 1e-6))
+    effective_nadir_bins = max(nadir_mask_bins, dynamic_nadir)
+    if effective_nadir_bins > 0 and len(corrected_line) > effective_nadir_bins:
+        corrected_line[:effective_nadir_bins] = 0
 
     return corrected_line
 
@@ -200,16 +257,30 @@ def compute_egn_curve(waterfall):
     Uses column-wise mean of non-zero pixels, double-smoothed
     with a wide kernel to isolate the low-frequency beam pattern.
     """
-    col_sums = waterfall.sum(axis=0)
-    col_counts = (waterfall != 0).sum(axis=0).astype(np.float64) + 1e-6
-    egn_curve = col_sums / col_counts
+    egn_curve = np.zeros(waterfall.shape[1], dtype=np.float64)
+    for c in range(waterfall.shape[1]):
+        col = waterfall[:, c]
+        valid = col[col > 0]
+        if len(valid) == 0:
+            continue
+        # Use median instead of mean to avoid outlier-driven beam estimates.
+        egn_curve[c] = np.median(valid)
 
-    kernel_size = min(200, len(egn_curve) // 2)
+    # Fill holes in curve, then smooth heavily to retain only low-frequency beam shape.
+    valid_idx = np.flatnonzero(egn_curve > 0)
+    if len(valid_idx) < 2:
+        return np.where(egn_curve > 0, egn_curve, 1.0)
+    missing_idx = np.flatnonzero(egn_curve <= 0)
+    if len(missing_idx) > 0:
+        egn_curve[missing_idx] = np.interp(missing_idx, valid_idx, egn_curve[valid_idx])
+
+    kernel_size = min(EGN_SMOOTH_WINDOW, len(egn_curve) // 2)
     if kernel_size > 1:
-        kernel = np.ones(kernel_size) / kernel_size
+        kernel = np.ones(kernel_size, dtype=np.float64) / float(kernel_size)
         smoothed = np.convolve(egn_curve, kernel, mode='same')
-        return np.convolve(smoothed, kernel, mode='same')
-    return egn_curve
+        egn_curve = np.convolve(smoothed, kernel, mode='same')
+
+    return np.where(egn_curve > 1e-6, egn_curve, 1.0)
 
 
 def apply_egn(waterfall, egn_curve):
@@ -217,10 +288,75 @@ def apply_egn(waterfall, egn_curve):
     Applies the inverse beam pattern for even illumination.
     Returns float32 (no uint8 clipping to preserve dynamic range).
     """
-    global_mean = np.mean(egn_curve)
+    global_mean = np.median(egn_curve[egn_curve > 0])
     safe_curve = np.where(egn_curve < 1e-6, 1e-6, egn_curve)
     gain_factors = global_mean / safe_curve
+    gain_factors = np.clip(gain_factors, EGN_GAIN_MIN, EGN_GAIN_MAX)
     return (waterfall * gain_factors).astype(np.float32)
+
+
+def lee_despeckle(image, window_size=7):
+    """
+    Adaptive Lee filter for speckle suppression while preserving edges.
+    """
+    img = image.astype(np.float32)
+    mean_local = uniform_filter(img, size=window_size)
+    mean_sq_local = uniform_filter(img * img, size=window_size)
+    var_local = np.clip(mean_sq_local - mean_local * mean_local, 0.0, None)
+
+    positive_var = var_local[var_local > 0]
+    if len(positive_var) == 0:
+        return img
+    noise_var = np.percentile(positive_var, 15)
+
+    weight = var_local / (var_local + noise_var + 1e-6)
+    filtered = mean_local + weight * (img - mean_local)
+    return filtered.astype(np.float32)
+
+
+def log_compress(data, scale=6.0):
+    """
+    Log compression to tame bright outliers and reveal seabed structure.
+    """
+    out = data.astype(np.float32).copy()
+    valid = out > 0
+    if not np.any(valid):
+        return out
+    v = out[valid]
+    p99 = np.percentile(v, 99.5)
+    if p99 <= 0:
+        return out
+    x = np.clip(v / p99, 0.0, None)
+    out[valid] = np.log1p(scale * x) / np.log1p(scale)
+    return out
+
+
+def balance_ping_levels(waterfall):
+    """
+    Remove row-wise gain jitter using robust per-row medians.
+    """
+    w = waterfall.astype(np.float32).copy()
+    row_medians = np.zeros(w.shape[0], dtype=np.float32)
+    for i in range(w.shape[0]):
+        row = w[i]
+        valid = row[row > 0]
+        if len(valid) > 0:
+            row_medians[i] = np.median(valid)
+
+    valid_medians = row_medians[row_medians > 0]
+    if len(valid_medians) == 0:
+        return w
+    target = np.median(valid_medians)
+
+    for i in range(w.shape[0]):
+        med = row_medians[i]
+        if med <= 0:
+            continue
+        scale = target / med
+        valid = w[i] > 0
+        w[i, valid] *= scale
+
+    return w
 
 
 def calculate_texture(image, window_size=15):
@@ -246,86 +382,68 @@ def circular_lerp(a_deg, b_deg, t):
     return (a_deg + t * diff) % 360
 
 
-def smooth_and_filter_nav(nav_data, waterfall_rows):
+def smooth_and_filter_nav(nav_data, waterfall_rows, transformer=None):
     """
-    Smooth headings and filter GPS/heading outliers.
-    Uses COG computed from projected coordinates with a wide window,
-    then applies circular moving-average smoothing.
+    Compute COG headings from projected (UTM) coordinates and smooth them.
+    The instrument heading from the Garmin is too noisy for scan line painting,
+    so we derive heading entirely from GPS track using a wide step.
     """
     if len(nav_data) < 10:
         return nav_data, waterfall_rows
 
     x_vals = np.array([n[0] for n in nav_data])
     y_vals = np.array([n[1] for n in nav_data])
-    headings = np.array([n[2] for n in nav_data])
 
-    # Recompute COG from projected coordinates with a wider window
-    # to reduce GPS jitter (pingverter uses consecutive points only)
-    cog_headings = np.zeros_like(headings)
-    step = 5
-    for i in range(len(headings)):
+    # Project to UTM for accurate distance/bearing computation
+    if transformer is not None:
+        px, py = transformer.transform(x_vals, y_vals)
+    else:
+        px, py = x_vals.copy(), y_vals.copy()
+
+    # Compute COG from projected coordinates with a wide step
+    # 50-ping step ≈ 2-4m, enough for stable bearing estimation
+    step = 50
+    cog_headings = np.zeros(len(nav_data), dtype=np.float64)
+    for i in range(len(nav_data)):
         p_prev = max(0, i - step)
-        p_next = min(len(headings) - 1, i + step)
+        p_next = min(len(nav_data) - 1, i + step)
 
         if p_prev == p_next:
-            cog_headings[i] = headings[i]
+            cog_headings[i] = nav_data[i][2]  # fallback to instrument heading
             continue
 
-        dx = x_vals[p_next] - x_vals[p_prev]
-        dy = y_vals[p_next] - y_vals[p_prev]
+        dx = px[p_next] - px[p_prev]
+        dy = py[p_next] - py[p_prev]
         dist = np.sqrt(dx * dx + dy * dy)
 
         if dist < 0.5:
-            cog_headings[i] = headings[i]
+            cog_headings[i] = nav_data[i][2]
         else:
             cog_headings[i] = np.degrees(np.arctan2(dx, dy)) % 360
 
-    # Circular moving average
+    # Circular moving average to further smooth any GPS jitter
     if HEADING_SMOOTH_WINDOW > 1:
         window = HEADING_SMOOTH_WINDOW
         if window % 2 == 0:
             window += 1
         half = window // 2
-        heading_smooth = np.copy(cog_headings)
 
+        heading_smooth = np.copy(cog_headings)
         for i in range(half, len(cog_headings) - half):
             local = cog_headings[i - half:i + half + 1]
             sin_mean = np.mean(np.sin(np.radians(local)))
             cos_mean = np.mean(np.cos(np.radians(local)))
             heading_smooth[i] = np.degrees(np.arctan2(sin_mean, cos_mean)) % 360
+
+        # Extend edge smoothing (use nearest smoothed value instead of raw heading)
+        heading_smooth[:half] = heading_smooth[half]
+        heading_smooth[-half:] = heading_smooth[-(half + 1)]
     else:
         heading_smooth = cog_headings
 
-    # Outlier detection
-    heading_diff = np.abs(headings - heading_smooth)
-    heading_diff = np.minimum(heading_diff, 360 - heading_diff)
-
-    dx = np.diff(x_vals, prepend=x_vals[0])
-    dy = np.diff(y_vals, prepend=y_vals[0])
-    distances = np.sqrt(dx ** 2 + dy ** 2)
-    median_dist = np.median(distances[distances > 0])
-
-    heading_threshold = 30.0
-    position_threshold = max(5 * median_dist, 2.0)
-    valid_mask = (heading_diff < heading_threshold) & (distances < position_threshold)
-    valid_mask[:5] = True
-
-    removed = np.sum(~valid_mask)
-
-    if FILTER_OUTLIERS:
-        if removed > 0:
-            print(f"    Removed {removed} outlier pings ({100 * removed / len(nav_data):.1f}%)")
-        filtered_nav = [(x_vals[i], y_vals[i], heading_smooth[i])
-                        for i in range(len(nav_data)) if valid_mask[i]]
-        filtered_wf = [waterfall_rows[i]
-                       for i in range(len(waterfall_rows)) if valid_mask[i]]
-        return filtered_nav, filtered_wf
-    else:
-        if removed > 0:
-            print(f"    [Info] Potential outliers detected: {removed} (filtering disabled)")
-        smoothed_nav = [(x_vals[i], y_vals[i], heading_smooth[i])
-                        for i in range(len(nav_data))]
-        return smoothed_nav, waterfall_rows
+    smoothed_nav = [(x_vals[i], y_vals[i], heading_smooth[i])
+                    for i in range(len(nav_data))]
+    return smoothed_nav, waterfall_rows
 
 
 def determine_utm_epsg(lats, lons):
@@ -346,7 +464,212 @@ def determine_utm_epsg(lats, lons):
     return epsg
 
 
-def process_side(rsd_handle, meta_df, side_name, sign):
+def compute_next_offsets(meta_df):
+    """
+    Compute next record offsets from metadata.
+    Reading between consecutive offsets avoids bleeding into adjacent records.
+    """
+    next_offsets = np.full(len(meta_df), np.nan, dtype=np.float64)
+    if 'index' not in meta_df.columns or len(meta_df) < 2:
+        return next_offsets
+
+    offsets = pd.to_numeric(meta_df['index'], errors='coerce').to_numpy(dtype=np.float64)
+    for i in range(len(offsets) - 1):
+        curr_off = offsets[i]
+        next_off = offsets[i + 1]
+        if np.isfinite(curr_off) and np.isfinite(next_off) and next_off > curr_off:
+            next_offsets[i] = next_off
+    return next_offsets
+
+
+def read_ping_record(rsd_handle, file_size, offset, data_size, next_offset):
+    """
+    Read one ping record robustly.
+    Prefer [offset, next_offset) span when available; fallback to metadata size.
+    """
+    if offset < 0 or offset >= file_size:
+        return b""
+
+    ping_header_len = 37
+    fallback_read = max(0, data_size + ping_header_len)
+
+    if np.isfinite(next_offset) and next_offset > offset:
+        read_len = int(next_offset - offset)
+    else:
+        read_len = fallback_read
+
+    if read_len <= 0:
+        return b""
+
+    rsd_handle.seek(offset)
+    return rsd_handle.read(read_len)
+
+
+def extract_payload_candidates(record_data, sample_count):
+    """
+    Build candidate payload interpretations from the tail of a variable-length record.
+    """
+    candidates = {}
+    if sample_count <= 0 or not record_data:
+        return candidates
+
+    n = int(sample_count)
+
+    def add_shifted(shift_bytes):
+        end = len(record_data) - shift_bytes
+        if end <= 0:
+            return
+
+        suffix = "" if shift_bytes == 0 else f"_s{shift_bytes}"
+
+        if end >= n:
+            tail_u8 = np.frombuffer(record_data[end - n:end], dtype=np.uint8).astype(np.float32)
+            candidates[f"u8_tail{suffix}"] = tail_u8
+
+        if end >= (2 * n):
+            tail_2n = record_data[end - 2 * n:end]
+            raw_u8 = np.frombuffer(tail_2n, dtype=np.uint8)
+            u16_le = np.frombuffer(tail_2n, dtype="<u2")
+            u16_be = np.frombuffer(tail_2n, dtype=">u2")
+
+            candidates[f"u8_even{suffix}"] = raw_u8[0::2].astype(np.float32)
+            candidates[f"u8_odd{suffix}"] = raw_u8[1::2].astype(np.float32)
+            candidates[f"u16_le{suffix}"] = u16_le.astype(np.float32)
+            candidates[f"u16_be{suffix}"] = u16_be.astype(np.float32)
+
+            # High/low byte variants often reveal where Garmin packs effective intensity.
+            if shift_bytes == 0:
+                candidates["u16_le_hi"] = ((u16_le >> 8) & 0xFF).astype(np.float32)
+                candidates["u16_le_lo"] = (u16_le & 0xFF).astype(np.float32)
+
+    add_shifted(0)
+    add_shifted(16)
+    add_shifted(32)
+
+    return candidates
+
+
+def score_payload_line(samples):
+    """
+    Higher score = richer detail while retaining ping-to-ping continuity.
+    """
+    if samples is None or len(samples) < 16:
+        return -1e9
+
+    s = samples.astype(np.float64)
+    if np.allclose(s, s[0]):
+        return -1e9
+
+    # Normalize to robust percentile range so mode scoring is scale-invariant.
+    p99, p01 = np.percentile(s, [99, 1])
+    spread = p99 - p01
+    if spread <= 1e-6:
+        return -1e9
+
+    s_norm = np.clip((s - p01) / spread, 0.0, 1.0)
+
+    contrast = float(np.std(s_norm))
+    high_freq = float(np.std(np.diff(s_norm)))
+
+    # Reward non-flat distributions (detail-rich texture) independent of value magnitude.
+    hist, _ = np.histogram(s_norm, bins=64, range=(0.0, 1.0))
+    prob = hist.astype(np.float64)
+    prob /= (np.sum(prob) + 1e-12)
+    entropy = -np.sum(prob * np.log2(prob + 1e-12)) / np.log2(64.0)
+
+    return contrast + 0.75 * high_freq + 0.5 * float(entropy)
+
+
+def choose_payload_mode(rsd_handle, meta_df, next_offsets, file_size, side_name):
+    """
+    Auto-select payload decoding mode by scoring detail and continuity over sample pings.
+    """
+    mode_names = list(PAYLOAD_MODES) + list(PAYLOAD_EXTRA_MODES)
+    mode_scores = {m: [] for m in mode_names}
+    prev_rows = {m: None for m in mode_names}
+
+    valid_positions = []
+    for i, row in meta_df.iterrows():
+        if pd.notna(row.get('index')) and pd.notna(row.get('data_size')):
+            valid_positions.append(i)
+
+    if not valid_positions:
+        return "u8_tail"
+
+    probe_count = min(PAYLOAD_PROBE_PINGS, len(valid_positions))
+    probe_idx = np.linspace(0, len(valid_positions) - 1, probe_count, dtype=np.int32)
+
+    has_ping_cnt = 'ping_cnt' in meta_df.columns
+
+    for k in probe_idx:
+        row_pos = valid_positions[k]
+        row = meta_df.iloc[row_pos]
+
+        offset = int(row['index'])
+        data_size = int(row['data_size'])
+        next_off = next_offsets[row_pos]
+
+        if has_ping_cnt and pd.notna(row['ping_cnt']) and row['ping_cnt'] > 0:
+            n_samples = int(row['ping_cnt'])
+        else:
+            n_samples = FALLBACK_SAMPLE_COUNT
+
+        record_data = read_ping_record(rsd_handle, file_size, offset, data_size, next_off)
+        if len(record_data) < 32:
+            continue
+
+        candidates = extract_payload_candidates(record_data, n_samples)
+
+        for mode, arr in candidates.items():
+            if mode not in mode_scores:
+                continue
+
+            score = score_payload_line(arr)
+            prev = prev_rows[mode]
+
+            if prev is not None:
+                n = min(len(arr), len(prev), 512)
+                if n >= 32:
+                    a = arr[:n] - np.mean(arr[:n])
+                    b = prev[:n] - np.mean(prev[:n])
+                    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-6
+                    corr = float(np.dot(a, b) / denom)
+                    score += np.clip(corr, -0.5, 0.5)
+
+            mode_scores[mode].append(score)
+            prev_rows[mode] = arr
+
+    mean_scores = {
+        mode: (float(np.mean(scores)) if scores else -1e9)
+        for mode, scores in mode_scores.items()
+    }
+    best_mode = max(mean_scores, key=mean_scores.get)
+
+    print(f"  Auto-selected payload mode for {side_name}: {best_mode} (scores={mean_scores})")
+    return best_mode
+
+
+def extract_nav_point(row):
+    """
+    Extract navigation tuple in whichever coordinate columns exist.
+    """
+    x_coord, y_coord = None, None
+    if pd.notna(row.get('lon')) and pd.notna(row.get('lat')):
+        x_coord = float(row['lon'])
+        y_coord = float(row['lat'])
+    elif pd.notna(row.get('e')) and pd.notna(row.get('n')):
+        x_coord = float(row['e'])
+        y_coord = float(row['n'])
+
+    if x_coord is None:
+        return None
+
+    heading = float(row['instr_heading']) if pd.notna(row.get('instr_heading')) else 0.0
+    return x_coord, y_coord, heading
+
+
+def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload_mode_override="auto",
+                 reverse_samples=False):
     """
     Reads and processes one side (port or starboard) of sidescan data.
 
@@ -359,6 +682,8 @@ def process_side(rsd_handle, meta_df, side_name, sign):
 
     waterfall_rows = []
     nav_data = []
+    meta_df = meta_df.reset_index(drop=True)
+    next_offsets = compute_next_offsets(meta_df)
 
     file_size = os.path.getsize(RSD_FILE)
 
@@ -366,13 +691,22 @@ def process_side(rsd_handle, meta_df, side_name, sign):
     has_max_range = 'max_range' in meta_df.columns
     has_son_offset = 'son_offset' in meta_df.columns
     has_speed = 'speed_ms' in meta_df.columns
+    has_ping_cnt = 'ping_cnt' in meta_df.columns
 
     if has_max_range:
         print(f"  Using per-ping max_range from metadata")
     else:
         print(f"  Using fallback max_range = {MAX_RANGE_FALLBACK}m")
 
+    if payload_mode_override and payload_mode_override != "auto":
+        payload_mode = payload_mode_override
+        print(f"  Forced payload mode for {side_name}: {payload_mode}")
+    else:
+        payload_mode = choose_payload_mode(rsd_handle, meta_df, next_offsets, file_size, side_name)
+
     skipped_slow = 0
+    skipped_no_nav = 0
+    skipped_decode = 0
 
     for idx, row in tqdm(meta_df.iterrows(), total=len(meta_df), desc="Reading"):
         if pd.isna(row['index']) or pd.isna(row['data_size']):
@@ -390,31 +724,42 @@ def process_side(rsd_handle, meta_df, side_name, sign):
 
         rsd_handle.seek(offset)
         try:
-            ping_size = int(row['data_size'])
-            record_data = rsd_handle.read(ping_size)
+            body_size = int(row['data_size'])
+            next_off = next_offsets[idx]
+            record_data = read_ping_record(rsd_handle, file_size, offset, body_size, next_off)
 
-            # Determine header size: use son_offset from metadata if available
-            if has_son_offset and pd.notna(row['son_offset']):
-                header_size = int(row['son_offset'])
-            else:
-                header_size = 113
-
-            if len(record_data) < header_size:
+            if len(record_data) < 32:
                 continue
 
-            raw_intensities = np.frombuffer(record_data[header_size:], dtype=np.uint8)
+            if has_ping_cnt and pd.notna(row['ping_cnt']) and row['ping_cnt'] > 0:
+                n_samples = int(row['ping_cnt'])
+            else:
+                n_samples = FALLBACK_SAMPLE_COUNT
+
+            candidates = extract_payload_candidates(record_data, n_samples)
+            raw_intensities = candidates.get(payload_mode)
+            if raw_intensities is None and candidates:
+                # Fallback to first available mode for this ping if chosen mode is unavailable.
+                raw_intensities = next(iter(candidates.values()))
+            if raw_intensities is None:
+                skipped_decode += 1
+                continue
+
             if len(raw_intensities) == 0:
                 continue
+            if reverse_samples:
+                raw_intensities = raw_intensities[::-1].copy()
 
             # Per-ping range from metadata, or fallback
             if has_max_range and pd.notna(row['max_range']):
                 ping_max_range = float(row['max_range'])
             else:
                 ping_max_range = MAX_RANGE_FALLBACK
+            if ping_max_range <= 0:
+                continue
 
             # Compute slant ranges for this ping's samples
-            n_samples = len(raw_intensities)
-            slant_ranges = np.linspace(0, ping_max_range, n_samples)
+            slant_ranges = np.linspace(0, ping_max_range, len(raw_intensities))
 
             # TVG correction (in dB space, returns float32)
             if APPLY_TVG:
@@ -430,36 +775,36 @@ def process_side(rsd_handle, meta_df, side_name, sign):
                 OUTPUT_RESOLUTION, NADIR_MASK_BINS)
 
             if len(corrected) > 0:
+                nav_point = extract_nav_point(row)
+                if nav_point is None:
+                    # Keep intensity/nav arrays strictly aligned to avoid row shifts in georeferencing.
+                    skipped_no_nav += 1
+                    continue
                 waterfall_rows.append(corrected)
-
-                # Extract coordinates
-                utmx, utmy = None, None
-                if 'lon' in meta_df.columns and 'lat' in meta_df.columns \
-                        and pd.notna(row['lon']) and pd.notna(row['lat']):
-                    utmx = row['lon']
-                    utmy = row['lat']
-                elif 'e' in meta_df.columns and 'n' in meta_df.columns \
-                        and pd.notna(row['e']) and pd.notna(row['n']):
-                    utmx = row['e']
-                    utmy = row['n']
-
-                if utmx is not None:
-                    heading = row['instr_heading']
-                    nav_data.append((utmx, utmy, heading))
+                nav_data.append(nav_point)
 
         except Exception:
             continue
 
     if skipped_slow > 0:
         print(f"  Skipped {skipped_slow} near-stationary pings (speed < {MIN_SPEED_MS} m/s)")
+    if skipped_no_nav > 0:
+        print(f"  Skipped {skipped_no_nav} pings with missing navigation")
+    if skipped_decode > 0:
+        print(f"  Skipped {skipped_decode} pings that could not decode payload")
 
     if not waterfall_rows:
         print("  No valid data found.")
         return None, None, None, None
 
+    if len(nav_data) != len(waterfall_rows):
+        aligned_len = min(len(nav_data), len(waterfall_rows))
+        nav_data = nav_data[:aligned_len]
+        waterfall_rows = waterfall_rows[:aligned_len]
+
     # Smooth headings and filter outliers
     print("  Smoothing navigation data...")
-    nav_data, waterfall_rows = smooth_and_filter_nav(nav_data, waterfall_rows)
+    nav_data, waterfall_rows = smooth_and_filter_nav(nav_data, waterfall_rows, transformer=transformer)
 
     if not waterfall_rows:
         print("  No valid data after filtering.")
@@ -472,6 +817,10 @@ def process_side(rsd_handle, meta_df, side_name, sign):
     for i, r in enumerate(waterfall_rows):
         waterfall[i, :len(r)] = r
 
+    if APPLY_ROW_BALANCE:
+        print("  Balancing ping levels...")
+        waterfall = balance_ping_levels(waterfall)
+
     # EGN (beam pattern normalization) - applied BEFORE despeckle
     print("  Applying Gain Normalization...")
     egn_curve = compute_egn_curve(waterfall)
@@ -481,6 +830,9 @@ def process_side(rsd_handle, meta_df, side_name, sign):
     if APPLY_DESPECKLE:
         print("  Applying despeckle filter...")
         waterfall = median_filter(waterfall, size=DESPECKLE_SIZE).astype(np.float32)
+    if APPLY_LEE_FILTER:
+        print("  Applying adaptive Lee filter...")
+        waterfall = lee_despeckle(waterfall, window_size=LEE_WINDOW_SIZE)
 
     # Texture analysis on corrected waterfall
     texture_img = calculate_texture(waterfall, TEXTURE_WINDOW_SIZE)
@@ -493,9 +845,10 @@ def percentile_stretch(data, low_pct=2, high_pct=98):
     Percentile-based contrast stretch to uint8.
     Maps [low_percentile, high_percentile] -> [1, 255], with 0 reserved for nodata.
     """
-    valid = data[data > 0]
+    stretch_input = log_compress(data, LOG_COMPRESSION_SCALE) if APPLY_LOG_COMPRESSION else data
+    valid = stretch_input[stretch_input > 0]
     if len(valid) == 0:
-        return np.zeros_like(data, dtype=np.uint8)
+        return np.zeros_like(stretch_input, dtype=np.uint8)
 
     lo = np.percentile(valid, low_pct)
     hi = np.percentile(valid, high_pct)
@@ -503,8 +856,8 @@ def percentile_stretch(data, low_pct=2, high_pct=98):
     if hi <= lo:
         hi = lo + 1
 
-    stretched = (data - lo) / (hi - lo) * 254.0 + 1.0
-    stretched = np.where(data > 0, stretched, 0)
+    stretched = (stretch_input - lo) / (hi - lo) * 254.0 + 1.0
+    stretched = np.where(stretch_input > 0, stretched, 0)
     return np.clip(stretched, 0, 255).astype(np.uint8)
 
 
@@ -764,6 +1117,45 @@ def save_merged_geotiff(port_data, port_nav, star_data, star_nav,
         dst.write(output, 1)
 
 
+def run_payload_bakeoff(rsd_file, ss_port, ss_star, output_dir, output_resolution,
+                        output_crs=None, transformer=None, coord_type='projected'):
+    """
+    Render one merged intensity mosaic per payload decoding mode.
+    """
+    bakeoff_dir = os.path.join(output_dir, "payload_bakeoff")
+    os.makedirs(bakeoff_dir, exist_ok=True)
+
+    print("\n--- Payload Decode Bakeoff ---")
+    print(f"  Writing bakeoff mosaics to: {bakeoff_dir}")
+
+    mode_transformer = transformer if coord_type == 'geographic' else None
+
+    bakeoff_modes = list(PAYLOAD_MODES) + (list(PAYLOAD_EXTRA_MODES) if ENABLE_EXTRA_PAYLOAD_BAKEOFF else [])
+
+    for mode in bakeoff_modes:
+        print(f"\n  >>> Bakeoff mode: {mode}")
+        with open(rsd_file, 'rb') as f:
+            wf_p, _, nav_p, _ = process_side(
+                f, ss_port, "Port", -1, transformer=transformer, payload_mode_override=mode,
+                reverse_samples=REVERSE_PORT_SAMPLES
+            )
+            wf_s, _, nav_s, _ = process_side(
+                f, ss_star, "Starboard", 1, transformer=transformer, payload_mode_override=mode,
+                reverse_samples=REVERSE_STARBOARD_SAMPLES
+            )
+
+        bakeoff_file = os.path.join(bakeoff_dir, f"intensity_{mode}.tif")
+        save_merged_geotiff(
+            wf_p, nav_p, wf_s, nav_s,
+            output_resolution,
+            bakeoff_file,
+            raster_crs=output_crs,
+            transformer=mode_transformer,
+        )
+
+    print("  Bakeoff complete.")
+
+
 # === Execution ===
 if __name__ == "__main__":
     print("=" * 60)
@@ -772,11 +1164,19 @@ if __name__ == "__main__":
     print(f"  Resolution:  {OUTPUT_RESOLUTION * 100:.0f} cm/pixel")
     print(f"  TVG:         {APPLY_TVG} (spreading={TVG_SPREADING_DB} dB, absorption={ABSORPTION_COEFF} dB/m)")
     print(f"  Despeckle:   {APPLY_DESPECKLE} ({DESPECKLE_SIZE}x{DESPECKLE_SIZE} median)")
+    print(f"  Lee filter:  {APPLY_LEE_FILTER} ({LEE_WINDOW_SIZE}x{LEE_WINDOW_SIZE})")
     print(f"  Texture:     {TEXTURE_WINDOW_SIZE}px window (~{TEXTURE_WINDOW_SIZE * OUTPUT_RESOLUTION:.2f}m)")
     print(f"  Nadir mask:  {NADIR_MASK_BINS} bins ({NADIR_MASK_BINS * OUTPUT_RESOLUTION:.2f}m)")
+    print(f"  Nadir depth: factor={NADIR_ALTITUDE_FACTOR}")
     print(f"  Gap fill:    {FILL_GAPS} (interpolation, max {MAX_FILL_DISTANCE}m)")
     print(f"  Min speed:   {MIN_SPEED_MS} m/s")
     print(f"  Stretch:     {STRETCH_LOW_PCT}-{STRETCH_HIGH_PCT} percentile")
+    print(f"  Log comp:    {APPLY_LOG_COMPRESSION} (scale={LOG_COMPRESSION_SCALE})")
+    print(f"  Row balance: {APPLY_ROW_BALANCE}")
+    print(f"  Payload mode:{PAYLOAD_MODE_OVERRIDE_PORT} (port), {PAYLOAD_MODE_OVERRIDE_STARBOARD} (starboard)")
+    print(f"  Reverse samp:{REVERSE_PORT_SAMPLES} (port), {REVERSE_STARBOARD_SAMPLES} (starboard)")
+    print(f"  Bakeoff:     {ENABLE_PAYLOAD_BAKEOFF}")
+    print(f"  Bakeoff ext: {ENABLE_EXTRA_PAYLOAD_BAKEOFF}")
     print()
 
     # Ensure metadata exists
@@ -821,10 +1221,30 @@ if __name__ == "__main__":
     print(f"  Port pings:  {len(ss_port)}")
     print(f"  Star pings:  {len(ss_star)}")
 
+    if ENABLE_PAYLOAD_BAKEOFF:
+        run_payload_bakeoff(
+            RSD_FILE,
+            ss_port,
+            ss_star,
+            OUTPUT_DIR,
+            OUTPUT_RESOLUTION,
+            output_crs=output_crs,
+            transformer=transformer,
+            coord_type=coord_type,
+        )
+
     with open(RSD_FILE, 'rb') as f:
         # Process both sides
-        wf_p, tex_p, nav_p, sign_p = process_side(f, ss_port, "Port", -1)
-        wf_s, tex_s, nav_s, sign_s = process_side(f, ss_star, "Starboard", 1)
+        wf_p, tex_p, nav_p, sign_p = process_side(
+            f, ss_port, "Port", -1, transformer=transformer,
+            payload_mode_override=PAYLOAD_MODE_OVERRIDE_PORT,
+            reverse_samples=REVERSE_PORT_SAMPLES,
+        )
+        wf_s, tex_s, nav_s, sign_s = process_side(
+            f, ss_star, "Starboard", 1, transformer=transformer,
+            payload_mode_override=PAYLOAD_MODE_OVERRIDE_STARBOARD,
+            reverse_samples=REVERSE_STARBOARD_SAMPLES,
+        )
 
     # Save individual side GeoTIFFs
     print("\n--- Saving Individual GeoTIFFs ---")
