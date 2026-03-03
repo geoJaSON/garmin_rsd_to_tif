@@ -31,7 +31,7 @@ from pyproj import CRS, Transformer
 
 
 # === Configuration ===
-RSD_FILE = r"C:\Users\jason\Downloads\Side.RSD"
+RSD_FILE = r"path_to_rsd_file"
 
 RSD_BASENAME = os.path.splitext(os.path.basename(RSD_FILE))[0]
 RSD_PARENT_DIR = os.path.dirname(RSD_FILE)

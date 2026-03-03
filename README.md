@@ -91,6 +91,22 @@ All parameters are defined at the top of `garmin_mosaic.py`:
 | `STRETCH_HIGH_PCT` | `98` | Upper percentile for contrast stretch |
 | `TEXTURE_WINDOW_SIZE` | `15` | Texture analysis window in pixels |
 
+### Garmin RSD channel mapping (current defaults)
+
+The current script defaults are tuned for Garmin RSD files like `Side.RSD` and use the following channel configuration:
+
+- **Port side**:
+  - Source: `channel_id = 1` from `All-Garmin-Sonar-MetaData.csv` (`USE_PORT_CHANNEL_OVERRIDE = True`, `PORT_CHANNEL_OVERRIDE_ID = 1`)
+  - Payload decode: `PAYLOAD_MODE_OVERRIDE_PORT = "u8_odd"` (odd 8‑bit bytes regarded as intensity)
+  - Sample direction: `REVERSE_PORT_SAMPLES = False`
+  - Range: `PORT_MAX_RANGE_OVERRIDE_M = 15.0` m (≈50 ft swath per side)
+- **Starboard side**:
+  - Source: `B003_ss_star_meta.csv` (`channel_id = 5`)
+  - Payload decode: `PAYLOAD_MODE_OVERRIDE_STARBOARD = "u8_odd"`
+  - Range: derived from metadata (`max_range ≈ pixM * ping_cnt`)
+
+If you change to a different Garmin head or firmware and the port image looks mis-scaled or garbled while starboard is clean, you will likely need to retune these few configuration constants rather than modifying the processing pipeline itself.
+
 ## How It Works
 
 ### TVG (Time Varied Gain)
