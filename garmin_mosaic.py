@@ -31,7 +31,8 @@ from pyproj import CRS, Transformer
 
 
 # === Configuration ===
-RSD_FILE = r"path_to_rsd_file"
+#RSD_FILE = os.environ.get("GARMIN_RSD_FILE", r"path_to_rsd_file")
+RSD_FILE = r"C:\Users\jason\Documents\RSD_FILES\12AUG25-0755-01.RSD"
 
 RSD_BASENAME = os.path.splitext(os.path.basename(RSD_FILE))[0]
 RSD_PARENT_DIR = os.path.dirname(RSD_FILE)
@@ -65,10 +66,19 @@ MIN_SPEED_MS = 0.3           # Skip pings below this speed (m/s), 0 to disable
 # Gap filling
 FILL_GAPS = True
 MAX_FILL_DISTANCE = 2.0     # Max interpolation distance between pings (meters)
+OVERLAP_POLICY = "first"    # "first" keeps earliest painted pixel, "last" overwrites with newest
 
 # Nadir zone
 NADIR_MASK_BINS = 12         # Zero out first N ground-range bins (nadir artifact)
 NADIR_ALTITUDE_FACTOR = 0.75  # Extra nadir mask from altitude: bins = altitude*factor/resolution
+
+# Downscan-based nadir fill (paints bottom-return intensity along the boat track
+# to close the sidescan nadir gap with real acoustic data)
+APPLY_DOWNSCAN_NADIR_FILL = True
+DOWNSCAN_META_NAME = "B001_ds_hifreq_meta.csv"  # alt: "B004_ds_vhifreq_meta.csv"
+DOWNSCAN_STRIP_WIDTH_M = 0.6       # cross-track paint width centered on boat
+DOWNSCAN_BOTTOM_WINDOW_M = 0.25    # vertical averaging window around bottom return
+DOWNSCAN_PAYLOAD_MODE_OVERRIDE = "auto"  # "auto" or specific mode
 
 # Raster gap fill (post-processing to close single-pixel gaps from scan line divergence)
 GAP_FILL_PASSES = 3          # Iterative neighbor-mean fill passes (0 to disable, 2-3 typical)
@@ -92,8 +102,8 @@ PAYLOAD_EXTRA_MODES = [
     "u8_tail_s24", "u8_even_s24", "u8_odd_s24", "u16_le_s24", "u16_be_s24",
     "u8_tail_s32", "u8_even_s32", "u8_odd_s32", "u16_le_s32", "u16_be_s32",
 ]
-PAYLOAD_MODE_OVERRIDE_PORT = "u8_odd"       # "auto" or one of PAYLOAD_MODES
-PAYLOAD_MODE_OVERRIDE_STARBOARD = "u8_odd"  # "auto" or one of PAYLOAD_MODES
+PAYLOAD_MODE_OVERRIDE_PORT = "son_u16_le"       # "auto" or one of PAYLOAD_MODES
+PAYLOAD_MODE_OVERRIDE_STARBOARD = "son_u16_le"  # "auto" or one of PAYLOAD_MODES
 ENABLE_PAYLOAD_BAKEOFF = False   # Export one mosaic per payload decode mode
 ENABLE_EXTRA_PAYLOAD_BAKEOFF = False  # Include offset-shifted payload modes in bakeoff
 
@@ -373,11 +383,40 @@ def balance_ping_levels(waterfall):
         med = row_medians[i]
         if med <= 0:
             continue
-        scale = target / med
+        # Clamp prevents dim/noisy rows from being amplified unbounded,
+        # which otherwise inject bright streaks that EGN can't undo.
+        scale = np.clip(target / med, 0.5, 2.0)
         valid = w[i] > 0
         w[i, valid] *= scale
 
     return w
+
+
+def match_side_levels(port_data, star_data):
+    """
+    Rescale port and starboard waterfalls so their non-zero medians match.
+    Removes the along-track seam created by per-side independent EGN.
+    """
+    if port_data is None or star_data is None:
+        return port_data, star_data
+
+    port_valid = port_data[port_data > 0]
+    star_valid = star_data[star_data > 0]
+    if len(port_valid) == 0 or len(star_valid) == 0:
+        return port_data, star_data
+
+    port_med = float(np.median(port_valid))
+    star_med = float(np.median(star_valid))
+    if port_med <= 0 or star_med <= 0:
+        return port_data, star_data
+
+    target = 0.5 * (port_med + star_med)
+    port_scale = np.clip(target / port_med, 0.5, 2.0)
+    star_scale = np.clip(target / star_med, 0.5, 2.0)
+
+    print(f"  Side level match: port x{port_scale:.3f}, star x{star_scale:.3f}")
+    return (port_data.astype(np.float32) * port_scale,
+            star_data.astype(np.float32) * star_scale)
 
 
 def calculate_texture(image, window_size=15):
@@ -603,7 +642,9 @@ def extract_payload_candidates(record_data, sample_count, son_offset=None):
 
 def score_payload_line(samples):
     """
-    Higher score = richer detail while retaining ping-to-ping continuity.
+    Per-ping detail score. Higher = richer structure.
+    Entropy is intentionally NOT rewarded: uniform-distribution entropy is
+    maximized by random bytes, which is exactly the wrong-decode signature.
     """
     if samples is None or len(samples) < 16:
         return -1e9
@@ -612,7 +653,6 @@ def score_payload_line(samples):
     if np.allclose(s, s[0]):
         return -1e9
 
-    # Normalize to robust percentile range so mode scoring is scale-invariant.
     p99, p01 = np.percentile(s, [99, 1])
     spread = p99 - p01
     if spread <= 1e-6:
@@ -623,82 +663,186 @@ def score_payload_line(samples):
     contrast = float(np.std(s_norm))
     high_freq = float(np.std(np.diff(s_norm)))
 
-    # Reward non-flat distributions (detail-rich texture) independent of value magnitude.
-    hist, _ = np.histogram(s_norm, bins=64, range=(0.0, 1.0))
-    prob = hist.astype(np.float64)
-    prob /= (np.sum(prob) + 1e-12)
-    entropy = -np.sum(prob * np.log2(prob + 1e-12)) / np.log2(64.0)
+    return contrast + 0.75 * high_freq
 
-    return contrast + 0.75 * high_freq + 0.5 * float(entropy)
+
+def mode_simplicity_bonus(mode):
+    """
+    Nudge toward canonical modes. The top cluster (e.g. u8_odd + u8_odd_s16 +
+    u8_odd_s24 + u8_odd_s32) reads the same underlying bytes at different
+    offsets and scores within ~0.02 of each other; without a decisive bonus
+    the winner flips arbitrarily between runs.
+    """
+    bonus = 0.0
+    if "_s" not in mode:
+        bonus += 0.05
+    if mode in ("u8_tail", "u8_odd", "u8_even", "u16_le", "u16_be"):
+        bonus += 0.02
+    return bonus
+
+
+def range_profile_score(stack):
+    """
+    Reward stable range-dependent structure averaged across probes.
+    Correct decode: per-ping range profile has a nadir bump + decay at
+    roughly consistent sample indices, so the mean profile retains
+    low-frequency shape after smoothing. Wrong decode: each row is ~random,
+    so the mean profile is near-flat and loses most of its std when smoothed.
+
+    Returns smoothed_std / raw_std ∈ [0, 1]. Noise ≈ 1/sqrt(window) (~0.2);
+    real signal ≈ 0.7+.
+    """
+    if stack.ndim != 2 or stack.shape[0] < 2 or stack.shape[1] < 16:
+        return 0.0
+
+    s = stack.astype(np.float64)
+    p99 = np.percentile(s, 99, axis=1, keepdims=True)
+    p01 = np.percentile(s, 1, axis=1, keepdims=True)
+    spread = np.maximum(p99 - p01, 1e-6)
+    sn = np.clip((s - p01) / spread, 0.0, 1.0)
+
+    mean_profile = np.mean(sn, axis=0)
+    raw_std = float(np.std(mean_profile))
+    if raw_std < 1e-6:
+        return 0.0
+
+    window = max(3, min(21, len(mean_profile) // 20))
+    if window % 2 == 0:
+        window += 1
+    kernel = np.ones(window, dtype=np.float64) / float(window)
+    smoothed = np.convolve(mean_profile, kernel, mode='same')
+    return float(np.std(smoothed) / raw_std)
 
 
 def choose_payload_mode(rsd_handle, meta_df, next_offsets, file_size, side_name):
     """
-    Auto-select payload decoding mode by scoring detail and continuity over sample pings.
+    Auto-select payload decoding mode.
+
+    Scoring combines three independent signals:
+      - per-ping detail (contrast + high-frequency variation)
+      - adjacent-ping correlation (true backscatter is correlated 0.7-0.95
+        between neighbors; random bytes are uncorrelated)
+      - aggregate range-profile structure (correct decode produces a
+        stable nadir bump + decay; noise produces a flat mean profile)
+
+    A small simplicity bonus breaks near-ties toward canonical modes.
     """
     mode_names = list(PAYLOAD_MODES) + list(PAYLOAD_EXTRA_MODES)
-    mode_scores = {m: [] for m in mode_names}
-    prev_rows = {m: None for m in mode_names}
-
-    valid_positions = []
-    for i, row in meta_df.iterrows():
-        if pd.notna(row.get('index')) and pd.notna(row.get('data_size')):
-            valid_positions.append(i)
-
-    if not valid_positions:
-        return "u8_tail"
-
-    probe_count = min(PAYLOAD_PROBE_PINGS, len(valid_positions))
-    probe_idx = np.linspace(0, len(valid_positions) - 1, probe_count, dtype=np.int32)
+    per_ping_scores = {m: [] for m in mode_names}
+    adjacent_corrs = {m: [] for m in mode_names}
+    sample_stacks = {m: [] for m in mode_names}
 
     has_ping_cnt = 'ping_cnt' in meta_df.columns
+    has_speed = 'speed_ms' in meta_df.columns
+    has_son_offset = 'son_offset' in meta_df.columns
 
-    for k in probe_idx:
-        row_pos = valid_positions[k]
+    # Speed filter excludes docked/idling pings at trip endpoints that
+    # otherwise degrade the probe set with weak signal.
+    valid_positions = []
+    for i, row in meta_df.iterrows():
+        if pd.isna(row.get('index')) or pd.isna(row.get('data_size')):
+            continue
+        if has_speed and MIN_SPEED_MS > 0:
+            speed = row.get('speed_ms')
+            if pd.notna(speed) and speed < MIN_SPEED_MS:
+                continue
+        valid_positions.append(i)
+
+    if len(valid_positions) < 2:
+        return "u8_tail"
+
+    # Each probe needs a following ping for adjacent-ping correlation.
+    probe_ceiling = len(valid_positions) - 1
+    probe_count = min(PAYLOAD_PROBE_PINGS, probe_ceiling)
+    probe_idx = np.linspace(0, probe_ceiling - 1, probe_count, dtype=np.int32)
+
+    def read_candidates(row_pos):
         row = meta_df.iloc[row_pos]
-
         offset = int(row['index'])
         data_size = int(row['data_size'])
         next_off = next_offsets[row_pos]
-
-        if has_ping_cnt and pd.notna(row['ping_cnt']) and row['ping_cnt'] > 0:
+        if has_ping_cnt and pd.notna(row.get('ping_cnt')) and row['ping_cnt'] > 0:
             n_samples = int(row['ping_cnt'])
         else:
             n_samples = FALLBACK_SAMPLE_COUNT
-
         record_data = read_ping_record(rsd_handle, file_size, offset, data_size, next_off)
         if len(record_data) < 32:
+            return None
+        son_offset = int(row['son_offset']) if (has_son_offset and pd.notna(row.get('son_offset'))) else None
+        return extract_payload_candidates(record_data, n_samples, son_offset=son_offset)
+
+    for k in probe_idx:
+        cand_a = read_candidates(valid_positions[k])
+        cand_b = read_candidates(valid_positions[k + 1])
+        if cand_a is None or cand_b is None:
             continue
 
-        son_offset = int(row['son_offset']) if ('son_offset' in meta_df.columns and pd.notna(row.get('son_offset'))) else None
-        candidates = extract_payload_candidates(record_data, n_samples, son_offset=son_offset)
-
-        for mode, arr in candidates.items():
-            if mode not in mode_scores:
+        for mode in mode_names:
+            a = cand_a.get(mode)
+            b = cand_b.get(mode)
+            if a is None or b is None or len(a) < 16:
                 continue
 
-            score = score_payload_line(arr)
-            prev = prev_rows[mode]
+            per_ping_scores[mode].append(score_payload_line(a))
+            sample_stacks[mode].append(a)
 
-            if prev is not None:
-                n = min(len(arr), len(prev), 512)
-                if n >= 32:
-                    a = arr[:n] - np.mean(arr[:n])
-                    b = prev[:n] - np.mean(prev[:n])
-                    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-6
-                    corr = float(np.dot(a, b) / denom)
-                    score += np.clip(corr, -0.5, 0.5)
+            n = min(len(a), len(b), 1024)
+            if n >= 32:
+                ar = a[:n].astype(np.float64) - np.mean(a[:n])
+                br = b[:n].astype(np.float64) - np.mean(b[:n])
+                denom = (np.linalg.norm(ar) * np.linalg.norm(br)) + 1e-6
+                adjacent_corrs[mode].append(float(np.dot(ar, br) / denom))
 
-            mode_scores[mode].append(score)
-            prev_rows[mode] = arr
+    score_details = {}
+    for mode in mode_names:
+        raw_scores = per_ping_scores[mode]
+        attempted = len(raw_scores)
+        valid = [s for s in raw_scores if s > -1e8]
+        # Require ≥25% of probes to pass the per-ping filter; a mode that
+        # survives aggregation but fails on most pings produces a black mosaic.
+        min_required = max(3, attempted // 4) if attempted else 0
+        if not valid or len(valid) < min_required:
+            score_details[mode] = {
+                "total": -1e9, "per_ping": -1e9, "corr": 0.0,
+                "profile": 0.0, "bonus": 0.0, "valid": len(valid),
+            }
+            continue
 
-    mean_scores = {
-        mode: (float(np.mean(scores)) if scores else -1e9)
-        for mode, scores in mode_scores.items()
-    }
-    best_mode = max(mean_scores, key=mean_scores.get)
+        per_ping = float(np.mean(valid))
+        corr_mean = float(np.mean(adjacent_corrs[mode])) if adjacent_corrs[mode] else 0.0
 
-    print(f"  Auto-selected payload mode for {side_name}: {best_mode} (scores={mean_scores})")
+        stack = sample_stacks[mode]
+        profile = 0.0
+        if len(stack) >= 2:
+            min_len = min(len(s) for s in stack)
+            if min_len >= 16:
+                arr = np.stack([s[:min_len] for s in stack], axis=0)
+                profile = range_profile_score(arr)
+
+        bonus = mode_simplicity_bonus(mode)
+        total = per_ping + 1.5 * corr_mean + 1.0 * profile + bonus
+        score_details[mode] = {
+            "total": total, "per_ping": per_ping, "corr": corr_mean,
+            "profile": profile, "bonus": bonus, "valid": len(valid),
+        }
+
+    best_mode = max(score_details, key=lambda m: score_details[m]["total"])
+
+    ranked = sorted(score_details.items(), key=lambda x: -x[1]["total"])
+    top = ranked[:5]
+    print(f"  Auto-selected payload mode for {side_name}: {best_mode}")
+    print(f"    Top candidates (total = per_ping + 1.5*corr + 1.0*profile + bonus):")
+    for mode, d in top:
+        print(
+            f"      {mode:>18s}: total={d['total']:.3f}  "
+            f"per_ping={d['per_ping']:.3f}  corr={d['corr']:.3f}  "
+            f"profile={d['profile']:.3f}  bonus={d['bonus']:.3f}  valid={d['valid']}"
+        )
+    if len(ranked) >= 2:
+        margin = ranked[0][1]["total"] - ranked[1][1]["total"]
+        if margin < 0.02:
+            print(f"    WARNING: top two modes within {margin:.3f} — decode is ambiguous")
+
     return best_mode
 
 
@@ -895,12 +1039,15 @@ def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload
     if APPLY_DESPECKLE:
         print("  Applying despeckle filter...")
         waterfall = median_filter(waterfall, size=DESPECKLE_SIZE).astype(np.float32)
+
+    # Texture BEFORE Lee: Lee suppresses the local variance that
+    # calculate_texture measures. Median despeckle has already removed
+    # impulse noise, so residual variance is substrate-driven.
+    texture_img = calculate_texture(waterfall, TEXTURE_WINDOW_SIZE)
+
     if APPLY_LEE_FILTER:
         print("  Applying adaptive Lee filter...")
         waterfall = lee_despeckle(waterfall, window_size=LEE_WINDOW_SIZE)
-
-    # Texture analysis on corrected waterfall
-    texture_img = calculate_texture(waterfall, TEXTURE_WINDOW_SIZE)
 
     return waterfall, texture_img, nav_data, 1 if sign == 1 else -1
 
@@ -1006,6 +1153,204 @@ def process_side_raw_diagnostic(rsd_handle, meta_df, side_name, sign, transforme
     return waterfall, None, nav_data, 1 if sign == 1 else -1
 
 
+def process_downscan_nadir(rsd_handle, meta_df):
+    """
+    Extract bottom-return intensity per ping from the downscan channel.
+    The sample at slant_range ≈ instrument depth is the seafloor return
+    directly below the boat. Returns list of (x, y, heading, intensity).
+
+    Bottom detection: seeded from `inst_dep_m`, refined by local-maximum
+    search to handle small metadata errors and sample reversal.
+    """
+    print(f"\n--- Processing Downscan (nadir fill) ---")
+
+    meta_df = meta_df.reset_index(drop=True)
+    next_offsets = compute_next_offsets(meta_df)
+    file_size = os.path.getsize(RSD_FILE)
+
+    has_speed = 'speed_ms' in meta_df.columns
+    has_ping_cnt = 'ping_cnt' in meta_df.columns
+    has_max_range = 'max_range' in meta_df.columns
+    has_son_offset = 'son_offset' in meta_df.columns
+
+    if DOWNSCAN_PAYLOAD_MODE_OVERRIDE and DOWNSCAN_PAYLOAD_MODE_OVERRIDE != "auto":
+        payload_mode = DOWNSCAN_PAYLOAD_MODE_OVERRIDE
+        print(f"  Forced downscan payload mode: {payload_mode}")
+    else:
+        payload_mode = choose_payload_mode(rsd_handle, meta_df, next_offsets, file_size, "Downscan")
+
+    results = []
+    skipped_slow = 0
+    skipped_decode = 0
+    skipped_no_nav = 0
+    skipped_depth = 0
+
+    for idx, row in tqdm(meta_df.iterrows(), total=len(meta_df), desc="Downscan"):
+        if pd.isna(row['index']) or pd.isna(row['data_size']):
+            continue
+        offset = int(row['index'])
+        if offset >= file_size:
+            continue
+
+        if has_speed and MIN_SPEED_MS > 0:
+            speed = row.get('speed_ms')
+            if pd.notna(speed) and speed < MIN_SPEED_MS:
+                skipped_slow += 1
+                continue
+
+        try:
+            body_size = int(row['data_size'])
+            next_off = next_offsets[idx]
+            record_data = read_ping_record(rsd_handle, file_size, offset, body_size, next_off)
+            if len(record_data) < 32:
+                continue
+
+            if has_ping_cnt and pd.notna(row['ping_cnt']) and row['ping_cnt'] > 0:
+                n_samples = int(row['ping_cnt'])
+            else:
+                n_samples = FALLBACK_SAMPLE_COUNT
+
+            son_offset = int(row['son_offset']) if (has_son_offset and pd.notna(row.get('son_offset'))) else None
+            candidates = extract_payload_candidates(record_data, n_samples, son_offset=son_offset)
+            raw = candidates.get(payload_mode)
+            if raw is None and candidates:
+                raw = next(iter(candidates.values()))
+            if raw is None or len(raw) == 0:
+                skipped_decode += 1
+                continue
+
+            depth = float(row['inst_dep_m']) if pd.notna(row.get('inst_dep_m')) else 0.0
+            ping_max_range = float(row['max_range']) if (has_max_range and pd.notna(row['max_range'])) else MAX_RANGE_FALLBACK
+            if depth <= 0 or ping_max_range <= 0:
+                skipped_depth += 1
+                continue
+
+            # Seed bottom index from metadata depth, then refine via local peak.
+            expected = int(np.clip((depth / ping_max_range) * len(raw), 0, len(raw) - 1))
+            search_half = max(4, int(0.15 * len(raw)))
+            lo_s = max(int(0.03 * len(raw)), expected - search_half)
+            hi_s = min(len(raw), expected + search_half)
+            if lo_s < hi_s:
+                bottom_idx = lo_s + int(np.argmax(raw[lo_s:hi_s]))
+            else:
+                bottom_idx = expected
+
+            # Average over a vertical window of real seafloor samples.
+            win = max(1, int((DOWNSCAN_BOTTOM_WINDOW_M / ping_max_range) * len(raw) / 2))
+            lo = max(0, bottom_idx - win)
+            hi = min(len(raw), bottom_idx + win + 1)
+            if lo >= hi:
+                skipped_decode += 1
+                continue
+
+            bottom_intensity = float(np.mean(raw[lo:hi]))
+            if bottom_intensity <= 0:
+                continue
+
+            nav_point = extract_nav_point(row)
+            if nav_point is None:
+                skipped_no_nav += 1
+                continue
+            x, y, h = nav_point
+            results.append((x, y, h, bottom_intensity))
+        except Exception:
+            skipped_decode += 1
+            continue
+
+    if skipped_slow:
+        print(f"  Skipped {skipped_slow} downscan pings below speed threshold")
+    if skipped_decode:
+        print(f"  Skipped {skipped_decode} downscan pings with decode errors")
+    if skipped_no_nav:
+        print(f"  Skipped {skipped_no_nav} downscan pings with missing navigation")
+    if skipped_depth:
+        print(f"  Skipped {skipped_depth} downscan pings with invalid depth/range")
+    print(f"  Extracted {len(results)} nadir samples")
+    return results
+
+
+def match_downscan_levels(downscan_nadir, port_data, star_data):
+    """
+    Rescale downscan intensities so their median matches the combined
+    port+star median. Skips the match if either side is missing.
+    """
+    if not downscan_nadir:
+        return downscan_nadir
+
+    ds_vals = np.array([v for (_, _, _, v) in downscan_nadir], dtype=np.float64)
+    ds_vals = ds_vals[ds_vals > 0]
+    if len(ds_vals) == 0:
+        return downscan_nadir
+
+    target_parts = []
+    if port_data is not None:
+        pv = port_data[port_data > 0]
+        if pv.size:
+            target_parts.append(pv.astype(np.float64))
+    if star_data is not None:
+        sv = star_data[star_data > 0]
+        if sv.size:
+            target_parts.append(sv.astype(np.float64))
+    if not target_parts:
+        return downscan_nadir
+
+    ds_med = float(np.median(ds_vals))
+    target_med = float(np.median(np.concatenate(target_parts)))
+    if ds_med <= 0 or target_med <= 0:
+        return downscan_nadir
+
+    scale = target_med / ds_med
+    print(f"  Downscan level match: x{scale:.3f} (ds_med={ds_med:.1f}, target={target_med:.1f})")
+    return [(x, y, h, v * scale) for (x, y, h, v) in downscan_nadir]
+
+
+def paint_nadir_strip(intensity, ux, uy, head, strip_width_m, pixel_size,
+                      min_x, max_y, width, height, raster, raster_filled):
+    """
+    Paint a short perpendicular strip centered on (ux, uy) with uniform intensity.
+    Uses "first" overlap policy so already-painted sidescan pixels are preserved
+    and only the nadir gap gets filled.
+    """
+    if strip_width_m <= 0:
+        return
+
+    n_bins = max(2, int(strip_width_m / pixel_size) + 1)
+    half_w = strip_width_m / 2.0
+
+    # Perpendicular to heading; extend -half_w to +half_w
+    angle_rad = np.radians(head) + (np.pi / 2)
+    sin_a = np.sin(angle_rad)
+    cos_a = np.cos(angle_rad)
+
+    r_bins = np.linspace(-half_w, half_w, n_bins)
+    p_x = ux + r_bins * sin_a
+    p_y = uy + r_bins * cos_a
+
+    idx_x = ((p_x - min_x) / pixel_size).astype(np.int32)
+    idx_y = ((max_y - p_y) / pixel_size).astype(np.int32)
+
+    valid = (idx_x >= 0) & (idx_x < width) & (idx_y >= 0) & (idx_y < height)
+    if not np.any(valid):
+        return
+
+    pix_x = idx_x[valid]
+    pix_y = idx_y[valid]
+
+    flat_idx = pix_y.astype(np.int64) * width + pix_x.astype(np.int64)
+    _, keep_idx = np.unique(flat_idx, return_index=True)
+    pix_x = pix_x[keep_idx]
+    pix_y = pix_y[keep_idx]
+
+    writable = ~raster_filled[pix_y, pix_x]
+    if not np.any(writable):
+        return
+    pix_x = pix_x[writable]
+    pix_y = pix_y[writable]
+
+    raster[pix_y, pix_x] = intensity
+    raster_filled[pix_y, pix_x] = True
+
+
 def percentile_stretch(data, low_pct=2, high_pct=98):
     """
     Percentile-based contrast stretch to uint8.
@@ -1054,8 +1399,15 @@ def fill_raster_gaps(raster, passes=3):
 
 
 def paint_scan_line(line_data, ux, uy, head, side_sign, pixel_size,
-                    min_x, max_y, width, height, raster_sum, raster_count):
-    """Paint a single scan line into the accumulator grid."""
+                    min_x, max_y, width, height, raster, raster_filled,
+                    overlap_policy="first"):
+    """
+    Paint a single scan line into the raster grid.
+
+    Overlap policies:
+      "first" — keep earliest painted pixel.
+      "last"  — overwrite with newest painted pixel.
+    """
     angle_rad = np.radians(head) + (np.pi / 2 * side_sign)
     sin_a = np.sin(angle_rad)
     cos_a = np.cos(angle_rad)
@@ -1068,16 +1420,43 @@ def paint_scan_line(line_data, ux, uy, head, side_sign, pixel_size,
     idx_y = ((max_y - p_y) / pixel_size).astype(np.int32)
 
     valid = (idx_x >= 0) & (idx_x < width) & (idx_y >= 0) & (idx_y < height) & (line_data > 0)
+    if not np.any(valid):
+        return
 
-    raster_sum[idx_y[valid], idx_x[valid]] += line_data[valid]
-    raster_count[idx_y[valid], idx_x[valid]] += 1
+    pix_x = idx_x[valid]
+    pix_y = idx_y[valid]
+    pix_vals = line_data[valid]
+    flat_idx = pix_y.astype(np.int64) * width + pix_x.astype(np.int64)
+
+    if overlap_policy == "first":
+        _, keep_idx = np.unique(flat_idx, return_index=True)
+    elif overlap_policy == "last":
+        _, rev_idx = np.unique(flat_idx[::-1], return_index=True)
+        keep_idx = (len(flat_idx) - 1) - rev_idx
+    else:
+        raise ValueError(f"Unsupported overlap policy: {overlap_policy}")
+
+    pix_x = pix_x[keep_idx]
+    pix_y = pix_y[keep_idx]
+    pix_vals = pix_vals[keep_idx]
+
+    if overlap_policy == "first":
+        writable = ~raster_filled[pix_y, pix_x]
+        if not np.any(writable):
+            return
+        pix_x = pix_x[writable]
+        pix_y = pix_y[writable]
+        pix_vals = pix_vals[writable]
+
+    raster[pix_y, pix_x] = pix_vals
+    raster_filled[pix_y, pix_x] = True
 
 
 def save_geotiff(data, nav_data, side_sign, pixel_size, filename,
                  raster_crs=None, transformer=None):
     """
     Projects waterfall strips into a georeferenced raster.
-    Uses overlap averaging and interpolated gap filling.
+    Uses interpolated gap filling while preserving the chosen overlap policy.
     """
     if data is None or not nav_data:
         return
@@ -1103,8 +1482,8 @@ def save_geotiff(data, nav_data, side_sign, pixel_size, filename,
     width = int((max_x - min_x) / pixel_size)
     height = int((max_y - min_y) / pixel_size)
 
-    raster_sum = np.zeros((height, width), dtype=np.float64)
-    raster_count = np.zeros((height, width), dtype=np.uint16)
+    raster = np.zeros((height, width), dtype=np.float32)
+    raster_filled = np.zeros((height, width), dtype=bool)
 
     print(f"  Grid: {width} x {height} pixels")
 
@@ -1115,7 +1494,8 @@ def save_geotiff(data, nav_data, side_sign, pixel_size, filename,
 
         # Paint current ping
         paint_scan_line(line_data, ux, uy, head, side_sign, pixel_size,
-                        min_x, max_y, width, height, raster_sum, raster_count)
+                        min_x, max_y, width, height, raster, raster_filled,
+                        overlap_policy=OVERLAP_POLICY)
 
         # Interpolated gap filling between adjacent pings
         if FILL_GAPS and i > 0:
@@ -1143,13 +1523,8 @@ def save_geotiff(data, nav_data, side_sign, pixel_size, filename,
 
                     paint_scan_line(fill_data, interp_x, interp_y, interp_head,
                                     side_sign, pixel_size,
-                                    min_x, max_y, width, height,
-                                    raster_sum, raster_count)
-
-    # Compute average
-    raster = np.zeros((height, width), dtype=np.float32)
-    mask = raster_count > 0
-    raster[mask] = (raster_sum[mask] / raster_count[mask]).astype(np.float32)
+                                    min_x, max_y, width, height, raster, raster_filled,
+                                    overlap_policy=OVERLAP_POLICY)
 
     # Fill remaining single-pixel gaps from scan line divergence at far range
     if GAP_FILL_PASSES > 0:
@@ -1176,10 +1551,14 @@ def save_geotiff(data, nav_data, side_sign, pixel_size, filename,
 
 
 def save_merged_geotiff(port_data, port_nav, star_data, star_nav,
-                        pixel_size, filename, raster_crs=None, transformer=None):
+                        pixel_size, filename, raster_crs=None, transformer=None,
+                        downscan_nadir=None):
     """
     Merges port and starboard into a single georeferenced mosaic.
-    Overlap in the nadir zone is averaged for smooth blending.
+    Overlap is resolved by the configured paint policy instead of blending layers.
+    If downscan_nadir is supplied, bottom-return intensities are painted as
+    narrow along-track strips into the remaining nadir gap (gap-only, never
+    overwrites sidescan pixels).
     """
     if port_data is None and star_data is None:
         return
@@ -1208,8 +1587,8 @@ def save_merged_geotiff(port_data, port_nav, star_data, star_nav,
     width = int((max_x - min_x) / pixel_size)
     height = int((max_y - min_y) / pixel_size)
 
-    raster_sum = np.zeros((height, width), dtype=np.float64)
-    raster_count = np.zeros((height, width), dtype=np.uint16)
+    raster = np.zeros((height, width), dtype=np.float32)
+    raster_filled = np.zeros((height, width), dtype=bool)
 
     print(f"  Grid: {width} x {height} pixels")
 
@@ -1227,7 +1606,8 @@ def save_merged_geotiff(port_data, port_nav, star_data, star_nav,
             line_data = side_data[i].astype(np.float32)
 
             paint_scan_line(line_data, ux, uy, head, side_sign, pixel_size,
-                            min_x, max_y, width, height, raster_sum, raster_count)
+                            min_x, max_y, width, height, raster, raster_filled,
+                            overlap_policy=OVERLAP_POLICY)
 
             # Interpolated gap fill
             if FILL_GAPS and i > 0:
@@ -1253,13 +1633,44 @@ def save_merged_geotiff(port_data, port_nav, star_data, star_nav,
 
                         paint_scan_line(fill_data, interp_x, interp_y, interp_head,
                                         side_sign, pixel_size,
-                                        min_x, max_y, width, height,
-                                        raster_sum, raster_count)
+                                        min_x, max_y, width, height, raster, raster_filled,
+                                        overlap_policy=OVERLAP_POLICY)
 
-    # Average and fill gaps
-    raster = np.zeros((height, width), dtype=np.float32)
-    mask = raster_count > 0
-    raster[mask] = (raster_sum[mask] / raster_count[mask]).astype(np.float32)
+    # Downscan nadir fill: paint bottom-return intensity along the boat track
+    # into gaps only (raster_filled blocks overwrite of real sidescan data).
+    if downscan_nadir:
+        print("  Painting downscan nadir fill...")
+        if transformer is not None:
+            ds_proj = []
+            for x, y, h, v in downscan_nadir:
+                px, py = transformer.transform(x, y)
+                ds_proj.append((px, py, h, v))
+        else:
+            ds_proj = list(downscan_nadir)
+
+        prev = None
+        for entry in tqdm(ds_proj, desc="Downscan nadir"):
+            ux, uy, head, intensity = entry
+            paint_nadir_strip(intensity, ux, uy, head,
+                              DOWNSCAN_STRIP_WIDTH_M, pixel_size,
+                              min_x, max_y, width, height, raster, raster_filled)
+
+            # Along-track densification so the strip is continuous between pings
+            if prev is not None:
+                px, py, ph, pv = prev
+                dist = np.sqrt((ux - px) ** 2 + (uy - py) ** 2)
+                if 0 < dist <= MAX_FILL_DISTANCE:
+                    n_fills = max(1, int(dist / pixel_size))
+                    for k in range(1, n_fills):
+                        t = k / n_fills
+                        ix = px + t * (ux - px)
+                        iy = py + t * (uy - py)
+                        ih = circular_lerp(ph, head, t)
+                        iv = pv + t * (intensity - pv)
+                        paint_nadir_strip(iv, ix, iy, ih,
+                                          DOWNSCAN_STRIP_WIDTH_M, pixel_size,
+                                          min_x, max_y, width, height, raster, raster_filled)
+            prev = entry
 
     if GAP_FILL_PASSES > 0:
         raster = fill_raster_gaps(raster, GAP_FILL_PASSES)
@@ -1522,6 +1933,7 @@ if __name__ == "__main__":
     print(f"  Nadir mask:  {NADIR_MASK_BINS} bins ({NADIR_MASK_BINS * OUTPUT_RESOLUTION:.2f}m)")
     print(f"  Nadir depth: factor={NADIR_ALTITUDE_FACTOR}")
     print(f"  Gap fill:    {FILL_GAPS} (interpolation, max {MAX_FILL_DISTANCE}m)")
+    print(f"  Overlap:     {OVERLAP_POLICY}")
     print(f"  Min speed:   {MIN_SPEED_MS} m/s")
     print(f"  Stretch:     {STRETCH_LOW_PCT}-{STRETCH_HIGH_PCT} percentile")
     print(f"  Log comp:    {APPLY_LOG_COMPRESSION} (scale={LOG_COMPRESSION_SCALE})")
@@ -1538,6 +1950,7 @@ if __name__ == "__main__":
     print(f"  Port raw:    {ENABLE_PORT_RAW_BAKEOFF} (bin={PORT_RAW_BIN_SIZE_M}m)")
     print(f"  Port ch src: {ENABLE_PORT_CHANNEL_BAKEOFF} (channels={PORT_CHANNEL_IDS}, mode={PORT_CHANNEL_MODE})")
     print(f"  Port ch use: {USE_PORT_CHANNEL_OVERRIDE} (channel={PORT_CHANNEL_OVERRIDE_ID})")
+    print(f"  Nadir fill:  {APPLY_DOWNSCAN_NADIR_FILL} (src={DOWNSCAN_META_NAME}, strip={DOWNSCAN_STRIP_WIDTH_M}m)")
     print()
 
     # Ensure metadata exists
@@ -1556,7 +1969,22 @@ if __name__ == "__main__":
         channel_vals = pd.to_numeric(all_meta.get('channel_id'), errors='coerce')
         ss_port_alt = all_meta[channel_vals == float(PORT_CHANNEL_OVERRIDE_ID)].copy()
         ss_port_alt = ss_port_alt.reset_index(drop=True)
-        if len(ss_port_alt) > 0:
+
+        # Collision guard: if the override channel ID matches starboard's own
+        # channel ID, applying it would route port to read starboard records,
+        # producing a mirrored mosaic. Channel IDs vary by file, so the
+        # override winner from one RSD isn't portable to another.
+        star_channel = None
+        if 'channel_id' in ss_star.columns:
+            ch_vals = pd.to_numeric(ss_star['channel_id'], errors='coerce').dropna()
+            if len(ch_vals) > 0:
+                star_channel = int(ch_vals.iloc[0])
+
+        if star_channel is not None and star_channel == PORT_CHANNEL_OVERRIDE_ID:
+            print(f"  WARNING: Port channel override {PORT_CHANNEL_OVERRIDE_ID} "
+                  f"matches starboard's channel_id — skipping override to avoid "
+                  f"mirrored mosaic. Re-run the port channel bakeoff for this file.")
+        elif len(ss_port_alt) > 0:
             ss_port = ss_port_alt
             print(f"  Port source override: channel_id={PORT_CHANNEL_OVERRIDE_ID} from All-Garmin-Sonar-MetaData.csv")
         else:
@@ -1686,12 +2114,26 @@ if __name__ == "__main__":
 
     # Save merged port+starboard mosaic
     print("\n--- Saving Merged Mosaic ---")
+    wf_p_matched, wf_s_matched = match_side_levels(wf_p, wf_s)
+
+    downscan_nadir = None
+    if APPLY_DOWNSCAN_NADIR_FILL:
+        ds_meta_path = os.path.join(META_DIR, DOWNSCAN_META_NAME)
+        if os.path.exists(ds_meta_path):
+            ds_meta = pd.read_csv(ds_meta_path)
+            with open(RSD_FILE, 'rb') as f:
+                downscan_nadir = process_downscan_nadir(f, ds_meta)
+            downscan_nadir = match_downscan_levels(downscan_nadir, wf_p_matched, wf_s_matched)
+        else:
+            print(f"  Downscan metadata not found at {ds_meta_path}, skipping nadir fill")
+
     save_merged_geotiff(
-        wf_p, nav_p, wf_s, nav_s,
+        wf_p_matched, nav_p, wf_s_matched, nav_s,
         OUTPUT_RESOLUTION,
         os.path.join(OUTPUT_DIR, "intensity.tif"),
         raster_crs=output_crs,
         transformer=transformer if coord_type == 'geographic' else None,
+        downscan_nadir=downscan_nadir,
     )
     save_merged_geotiff(
         tex_p, nav_p, tex_s, nav_s,
