@@ -21,6 +21,7 @@ Outputs:
 import numpy as np
 import pandas as pd
 import os
+import sys
 import math
 from scipy.interpolate import interp1d
 from scipy.ndimage import median_filter, uniform_filter
@@ -31,8 +32,8 @@ from pyproj import CRS, Transformer
 
 
 # === Configuration ===
-#RSD_FILE = os.environ.get("GARMIN_RSD_FILE", r"path_to_rsd_file")
-RSD_FILE = r"C:\Users\jason\Documents\RSD_FILES\12AUG25-0755-01.RSD"
+# Point INPUT_PATH to a single .RSD file, or a directory containing multiple .RSD files.
+RSD_FILE = os.environ.get("GARMIN_RSD_FILE", r"path_to_rsd_file")
 
 RSD_BASENAME = os.path.splitext(os.path.basename(RSD_FILE))[0]
 RSD_PARENT_DIR = os.path.dirname(RSD_FILE)
@@ -45,9 +46,10 @@ ALL_META_FILE = os.path.join(META_DIR, "All-Garmin-Sonar-MetaData.csv")
 OUTPUT_RESOLUTION = 0.05    # 5cm per pixel
 TEXTURE_WINDOW_SIZE = 15    # Texture analysis window (~1.5m at 5cm res)
 MAX_RANGE_FALLBACK = 15.0   # Fallback if per-ping max_range not in metadata
-PORT_MAX_RANGE_OVERRIDE_M = 15.0  # Force port swath width when using alternate channel source
-PORT_RANGE_SCALE = 1.0            # Additional multiplicative range tuning for port
-STARBOARD_RANGE_SCALE = 1.0       # Additional multiplicative range tuning for starboard
+PORT_MAX_RANGE_OVERRIDE_M = 15.0       # Force port swath width; set to None to use per-ping metadata
+STARBOARD_MAX_RANGE_OVERRIDE_M = 15  # Force starboard swath width; set to None to use per-ping metadata
+PORT_RANGE_SCALE = 1.0                 # Additional multiplicative range tuning for port
+STARBOARD_RANGE_SCALE = 1.0            # Additional multiplicative range tuning for starboard
 
 # Radiometric Corrections
 APPLY_TVG = True
@@ -60,7 +62,6 @@ LEE_WINDOW_SIZE = 7          # Local window size for Lee filter
 
 # Navigation
 HEADING_SMOOTH_WINDOW = 100  # Heading smoothing window (pings)
-FILTER_OUTLIERS = False      # Remove heading/position outlier pings
 MIN_SPEED_MS = 0.3           # Skip pings below this speed (m/s), 0 to disable
 
 # Gap filling
@@ -69,8 +70,8 @@ MAX_FILL_DISTANCE = 2.0     # Max interpolation distance between pings (meters)
 OVERLAP_POLICY = "first"    # "first" keeps earliest painted pixel, "last" overwrites with newest
 
 # Nadir zone
-NADIR_MASK_BINS = 12         # Zero out first N ground-range bins (nadir artifact)
-NADIR_ALTITUDE_FACTOR = 0.75  # Extra nadir mask from altitude: bins = altitude*factor/resolution
+NADIR_MASK_BINS = 2          # Zero out first N ground-range bins (nadir artifact)
+NADIR_ALTITUDE_FACTOR = 0.0  # Extra nadir mask from altitude: bins = altitude*factor/resolution
 
 # Downscan-based nadir fill (paints bottom-return intensity along the boat track
 # to close the sidescan nadir gap with real acoustic data)
@@ -83,11 +84,15 @@ DOWNSCAN_PAYLOAD_MODE_OVERRIDE = "auto"  # "auto" or specific mode
 # Raster gap fill (post-processing to close single-pixel gaps from scan line divergence)
 GAP_FILL_PASSES = 3          # Iterative neighbor-mean fill passes (0 to disable, 2-3 typical)
 
-# Contrast stretch
-STRETCH_LOW_PCT = 2          # Lower percentile for output contrast stretch
-STRETCH_HIGH_PCT = 98        # Upper percentile for output contrast stretch
+# Contrast stretch & Color Calibration
+STRETCH_LOW_PCT = 2          # Lower percentile for output contrast stretch (if dynamic)
+STRETCH_HIGH_PCT = 98        # Upper percentile for output contrast stretch (if dynamic)
 APPLY_LOG_COMPRESSION = True  # Log-compress before percentile stretch
 LOG_COMPRESSION_SCALE = 6.0   # Higher = stronger highlight compression
+
+# Set to fixed floats (e.g. LO=0.0, HI=0.8) to lock brightness consistently across different passes.
+FIXED_STRETCH_LO = None       
+FIXED_STRETCH_HI = None
 
 # Record/payload decoding
 PAYLOAD_PROBE_PINGS = 150     # Number of pings used to auto-select payload decoding mode
@@ -104,24 +109,14 @@ PAYLOAD_EXTRA_MODES = [
 ]
 PAYLOAD_MODE_OVERRIDE_PORT = "son_u16_le"       # "auto" or one of PAYLOAD_MODES
 PAYLOAD_MODE_OVERRIDE_STARBOARD = "son_u16_le"  # "auto" or one of PAYLOAD_MODES
-ENABLE_PAYLOAD_BAKEOFF = False   # Export one mosaic per payload decode mode
-ENABLE_EXTRA_PAYLOAD_BAKEOFF = False  # Include offset-shifted payload modes in bakeoff
 
 # Side-specific sample ordering
-REVERSE_PORT_SAMPLES = False      # Locked from successful channel bakeoff (revF)
+REVERSE_PORT_SAMPLES = False
 REVERSE_STARBOARD_SAMPLES = False
 PORT_HEADING_OFFSET_DEG = 0.0    # Additional heading correction per side
 STARBOARD_HEADING_OFFSET_DEG = 0.0
-ENABLE_PORT_ORIENTATION_BAKEOFF = False  # Test port orientation flips
-ENABLE_PORT_SHIFT_BAKEOFF = False        # Test likely tail-byte offsets for port payload
-ENABLE_PORT_SOURCE_BAKEOFF = False       # Test son_offset-anchored payload extraction
-ENABLE_PORT_RAW_BAKEOFF = False           # Raw-bin diagnostic without slant/TVG/EGN
-PORT_RAW_BIN_SIZE_M = 0.02               # Range bin size for raw diagnostic georeferencing
-ENABLE_PORT_CHANNEL_BAKEOFF = False       # Build port candidates from global metadata channels
-PORT_CHANNEL_IDS = [1, 2, 3]             # Candidate channel IDs to test as true port source
-PORT_CHANNEL_MODE = "u8_odd"             # Payload mode for channel-source bakeoff ("auto" or mode)
 USE_PORT_CHANNEL_OVERRIDE = True         # Use channel override for normal port processing
-PORT_CHANNEL_OVERRIDE_ID = 1             # Winning channel from bakeoff
+PORT_CHANNEL_OVERRIDE_ID = 1             # Port channel_id in All-Garmin-Sonar-MetaData.csv
 
 # EGN stabilization
 EGN_SMOOTH_WINDOW = 250       # Smoothing width for beam-pattern estimate
@@ -129,9 +124,9 @@ EGN_GAIN_MIN = 0.45           # Prevent over-darkening
 EGN_GAIN_MAX = 2.20           # Prevent noise amplification
 
 # Ping-to-ping leveling
-APPLY_ROW_BALANCE = True      # Remove ping gain jitter before EGN
+APPLY_ROW_BALANCE = False     # Remove ping gain jitter before EGN
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 
 
 # === Metadata Generation ===
@@ -954,9 +949,11 @@ def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload
             else:
                 ping_max_range = MAX_RANGE_FALLBACK
 
-            # Channel-override port often reports shorter range metadata than true SS swath.
+            # Per-side range overrides (useful when metadata reports wrong swath width).
             if sign < 0 and PORT_MAX_RANGE_OVERRIDE_M is not None:
                 ping_max_range = float(PORT_MAX_RANGE_OVERRIDE_M)
+            elif sign > 0 and STARBOARD_MAX_RANGE_OVERRIDE_M is not None:
+                ping_max_range = float(STARBOARD_MAX_RANGE_OVERRIDE_M)
 
             if sign < 0:
                 ping_max_range *= PORT_RANGE_SCALE
@@ -1050,107 +1047,6 @@ def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload
         waterfall = lee_despeckle(waterfall, window_size=LEE_WINDOW_SIZE)
 
     return waterfall, texture_img, nav_data, 1 if sign == 1 else -1
-
-
-def process_side_raw_diagnostic(rsd_handle, meta_df, side_name, sign, transformer=None,
-                                payload_mode_override="auto", reverse_samples=False,
-                                heading_offset_deg=0.0):
-    """
-    Decode and georeference raw samples without TVG/slant/EGN/filtering.
-    Useful to diagnose channel packing/order independently of processing pipeline.
-    """
-    print(f"\n--- Raw Diagnostic {side_name} Side ---")
-
-    waterfall_rows = []
-    nav_data = []
-    meta_df = meta_df.reset_index(drop=True)
-    next_offsets = compute_next_offsets(meta_df)
-    file_size = os.path.getsize(RSD_FILE)
-
-    has_speed = 'speed_ms' in meta_df.columns
-    has_ping_cnt = 'ping_cnt' in meta_df.columns
-
-    if payload_mode_override and payload_mode_override != "auto":
-        payload_mode = payload_mode_override
-        print(f"  Forced payload mode for {side_name}: {payload_mode}")
-    else:
-        payload_mode = choose_payload_mode(rsd_handle, meta_df, next_offsets, file_size, side_name)
-
-    skipped_slow = 0
-    skipped_no_nav = 0
-    skipped_decode = 0
-
-    for idx, row in tqdm(meta_df.iterrows(), total=len(meta_df), desc="RawRead"):
-        if pd.isna(row['index']) or pd.isna(row['data_size']):
-            continue
-        offset = int(row['index'])
-        if offset >= file_size:
-            continue
-
-        if has_speed and MIN_SPEED_MS > 0:
-            speed = row['speed_ms']
-            if pd.notna(speed) and speed < MIN_SPEED_MS:
-                skipped_slow += 1
-                continue
-
-        try:
-            body_size = int(row['data_size'])
-            next_off = next_offsets[idx]
-            record_data = read_ping_record(rsd_handle, file_size, offset, body_size, next_off)
-            if len(record_data) < 32:
-                continue
-
-            if has_ping_cnt and pd.notna(row['ping_cnt']) and row['ping_cnt'] > 0:
-                n_samples = int(row['ping_cnt'])
-            else:
-                n_samples = FALLBACK_SAMPLE_COUNT
-
-            son_offset = int(row['son_offset']) if ('son_offset' in meta_df.columns and pd.notna(row.get('son_offset'))) else None
-            candidates = extract_payload_candidates(record_data, n_samples, son_offset=son_offset)
-            raw_intensities = candidates.get(payload_mode)
-            if raw_intensities is None and candidates:
-                raw_intensities = next(iter(candidates.values()))
-            if raw_intensities is None or len(raw_intensities) == 0:
-                skipped_decode += 1
-                continue
-
-            if reverse_samples:
-                raw_intensities = raw_intensities[::-1].copy()
-
-            nav_point = extract_nav_point(row)
-            if nav_point is None:
-                skipped_no_nav += 1
-                continue
-
-            # Raw diagnostic keeps native sample structure; only cast for raster accumulation.
-            waterfall_rows.append(raw_intensities.astype(np.float32))
-            x_nav, y_nav, h_nav = nav_point
-            nav_data.append((x_nav, y_nav, (h_nav + heading_offset_deg) % 360.0))
-        except Exception:
-            continue
-
-    if skipped_slow > 0:
-        print(f"  Skipped {skipped_slow} near-stationary pings (speed < {MIN_SPEED_MS} m/s)")
-    if skipped_no_nav > 0:
-        print(f"  Skipped {skipped_no_nav} pings with missing navigation")
-    if skipped_decode > 0:
-        print(f"  Skipped {skipped_decode} pings that could not decode payload")
-
-    if not waterfall_rows:
-        print("  No valid raw data found.")
-        return None, None, None, None
-
-    if len(nav_data) != len(waterfall_rows):
-        aligned_len = min(len(nav_data), len(waterfall_rows))
-        nav_data = nav_data[:aligned_len]
-        waterfall_rows = waterfall_rows[:aligned_len]
-
-    max_len = max(len(r) for r in waterfall_rows)
-    waterfall = np.zeros((len(waterfall_rows), max_len), dtype=np.float32)
-    for i, r in enumerate(waterfall_rows):
-        waterfall[i, :len(r)] = r
-
-    return waterfall, None, nav_data, 1 if sign == 1 else -1
 
 
 def process_downscan_nadir(rsd_handle, meta_df):
@@ -1361,8 +1257,12 @@ def percentile_stretch(data, low_pct=2, high_pct=98):
     if len(valid) == 0:
         return np.zeros_like(stretch_input, dtype=np.uint8)
 
-    lo = np.percentile(valid, low_pct)
-    hi = np.percentile(valid, high_pct)
+    if FIXED_STRETCH_LO is not None and FIXED_STRETCH_HI is not None:
+        lo = FIXED_STRETCH_LO
+        hi = FIXED_STRETCH_HI
+    else:
+        lo = np.percentile(valid, low_pct)
+        hi = np.percentile(valid, high_pct)
 
     if hi <= lo:
         hi = lo + 1
@@ -1412,20 +1312,27 @@ def paint_scan_line(line_data, ux, uy, head, side_sign, pixel_size,
     sin_a = np.sin(angle_rad)
     cos_a = np.cos(angle_rad)
 
-    r_bins = np.arange(len(line_data)) * pixel_size
+    # Double sample density along the scan line to ensure no grid projection gaps
+    dense_len = len(line_data) * 2
+    if dense_len == 0:
+        return
+    dense_idx = np.linspace(0, len(line_data) - 1, dense_len)
+    dense_data = np.interp(dense_idx, np.arange(len(line_data)), line_data)
+
+    r_bins = dense_idx * pixel_size
     p_x = ux + r_bins * sin_a
     p_y = uy + r_bins * cos_a
 
     idx_x = ((p_x - min_x) / pixel_size).astype(np.int32)
     idx_y = ((max_y - p_y) / pixel_size).astype(np.int32)
 
-    valid = (idx_x >= 0) & (idx_x < width) & (idx_y >= 0) & (idx_y < height) & (line_data > 0)
+    valid = (idx_x >= 0) & (idx_x < width) & (idx_y >= 0) & (idx_y < height) & (dense_data > 0)
     if not np.any(valid):
         return
 
     pix_x = idx_x[valid]
     pix_y = idx_y[valid]
-    pix_vals = line_data[valid]
+    pix_vals = dense_data[valid]
     flat_idx = pix_y.astype(np.int64) * width + pix_x.astype(np.int64)
 
     if overlap_policy == "first":
@@ -1503,7 +1410,7 @@ def save_geotiff(data, nav_data, side_sign, pixel_size, filename,
             ping_dist = np.sqrt((ux - prev_ux) ** 2 + (uy - prev_uy) ** 2)
 
             if 0 < ping_dist <= MAX_FILL_DISTANCE:
-                n_fills = max(1, int(ping_dist / pixel_size))
+                n_fills = max(1, int(np.ceil(ping_dist / pixel_size)))
                 prev_data = data[i - 1].astype(np.float32)
 
                 # Ensure both lines are same length for interpolation
@@ -1615,7 +1522,7 @@ def save_merged_geotiff(port_data, port_nav, star_data, star_nav,
                 ping_dist = np.sqrt((ux - prev_ux) ** 2 + (uy - prev_uy) ** 2)
 
                 if 0 < ping_dist <= MAX_FILL_DISTANCE:
-                    n_fills = max(1, int(ping_dist / pixel_size))
+                    n_fills = max(1, int(np.ceil(ping_dist / pixel_size)))
                     prev_data = side_data[i - 1].astype(np.float32)
 
                     max_len = max(len(prev_data), len(line_data))
@@ -1660,7 +1567,7 @@ def save_merged_geotiff(port_data, port_nav, star_data, star_nav,
                 px, py, ph, pv = prev
                 dist = np.sqrt((ux - px) ** 2 + (uy - py) ** 2)
                 if 0 < dist <= MAX_FILL_DISTANCE:
-                    n_fills = max(1, int(dist / pixel_size))
+                    n_fills = max(1, int(np.ceil(dist / pixel_size)))
                     for k in range(1, n_fills):
                         t = k / n_fills
                         ix = px + t * (ux - px)
@@ -1694,236 +1601,21 @@ def save_merged_geotiff(port_data, port_nav, star_data, star_nav,
         dst.write(output, 1)
 
 
-def run_payload_bakeoff(rsd_file, ss_port, ss_star, output_dir, output_resolution,
-                        output_crs=None, transformer=None, coord_type='projected'):
-    """
-    Render one merged intensity mosaic per payload decoding mode.
-    """
-    bakeoff_dir = os.path.join(output_dir, "payload_bakeoff")
-    os.makedirs(bakeoff_dir, exist_ok=True)
+def process_single_rsd(file_path):
+    global RSD_FILE, RSD_BASENAME, RSD_PARENT_DIR, OUTPUT_BASE_DIR, META_DIR, OUTPUT_DIR, ALL_META_FILE
+    
+    RSD_FILE = file_path
+    RSD_BASENAME = os.path.splitext(os.path.basename(RSD_FILE))[0]
+    RSD_PARENT_DIR = os.path.dirname(RSD_FILE)
+    OUTPUT_BASE_DIR = os.path.join(RSD_PARENT_DIR, f"garmin_output_{RSD_BASENAME}")
+    META_DIR = os.path.join(OUTPUT_BASE_DIR, "meta")
+    OUTPUT_DIR = os.path.join(OUTPUT_BASE_DIR, "processed")
+    ALL_META_FILE = os.path.join(META_DIR, "All-Garmin-Sonar-MetaData.csv")
+    
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print("\n--- Payload Decode Bakeoff ---")
-    print(f"  Writing bakeoff mosaics to: {bakeoff_dir}")
-
-    mode_transformer = transformer if coord_type == 'geographic' else None
-
-    bakeoff_modes = list(PAYLOAD_MODES) + (list(PAYLOAD_EXTRA_MODES) if ENABLE_EXTRA_PAYLOAD_BAKEOFF else [])
-
-    for mode in bakeoff_modes:
-        print(f"\n  >>> Bakeoff mode: {mode}")
-        with open(rsd_file, 'rb') as f:
-            wf_p, _, nav_p, _ = process_side(
-                f, ss_port, "Port", -1, transformer=transformer, payload_mode_override=mode,
-                reverse_samples=REVERSE_PORT_SAMPLES, heading_offset_deg=PORT_HEADING_OFFSET_DEG
-            )
-            wf_s, _, nav_s, _ = process_side(
-                f, ss_star, "Starboard", 1, transformer=transformer, payload_mode_override=mode,
-                reverse_samples=REVERSE_STARBOARD_SAMPLES, heading_offset_deg=STARBOARD_HEADING_OFFSET_DEG
-            )
-
-        bakeoff_file = os.path.join(bakeoff_dir, f"intensity_{mode}.tif")
-        save_merged_geotiff(
-            wf_p, nav_p, wf_s, nav_s,
-            output_resolution,
-            bakeoff_file,
-            raster_crs=output_crs,
-            transformer=mode_transformer,
-        )
-
-    print("  Bakeoff complete.")
-
-
-def run_port_orientation_bakeoff(rsd_file, ss_port, output_dir, output_resolution,
-                                 output_crs=None, transformer=None, coord_type='projected'):
-    """
-    Test port orientation variants for fixed payload mode.
-    """
-    orient_dir = os.path.join(output_dir, "port_orientation_bakeoff")
-    os.makedirs(orient_dir, exist_ok=True)
-    print("\n--- Port Orientation Bakeoff ---")
-    print(f"  Writing orientation mosaics to: {orient_dir}")
-
-    mode_transformer = transformer if coord_type == 'geographic' else None
-    base_mode = PAYLOAD_MODE_OVERRIDE_PORT
-    if base_mode == "auto":
-        base_mode = "u8_odd"
-
-    combos = [
-        ("revT_h0", True, 0.0),
-        ("revF_h0", False, 0.0),
-        ("revT_h180", True, 180.0),
-        ("revF_h180", False, 180.0),
-    ]
-
-    for label, rev_samples, heading_off in combos:
-        print(f"\n  >>> Port orientation: {label} mode={base_mode}")
-        with open(rsd_file, 'rb') as f:
-            wf_p, _, nav_p, sign_p = process_side(
-                f, ss_port, "Port", -1, transformer=transformer,
-                payload_mode_override=base_mode,
-                reverse_samples=rev_samples,
-                heading_offset_deg=heading_off,
-            )
-        out_file = os.path.join(orient_dir, f"port_{base_mode}_{label}.tif")
-        save_geotiff(
-            wf_p, nav_p, sign_p, output_resolution, out_file,
-            raster_crs=output_crs,
-            transformer=mode_transformer,
-        )
-
-    print("  Port orientation bakeoff complete.")
-
-
-def run_port_shift_bakeoff(rsd_file, ss_port, output_dir, output_resolution,
-                           output_crs=None, transformer=None, coord_type='projected'):
-    """
-    Test likely tail-shift offsets for the port payload decode.
-    """
-    shift_dir = os.path.join(output_dir, "port_shift_bakeoff")
-    os.makedirs(shift_dir, exist_ok=True)
-    print("\n--- Port Shift Bakeoff ---")
-    print(f"  Writing shift mosaics to: {shift_dir}")
-
-    mode_transformer = transformer if coord_type == 'geographic' else None
-    modes = ["u8_odd", "u8_odd_s16", "u8_odd_s23", "u8_odd_s24", "u8_odd_s32"]
-
-    for mode in modes:
-        print(f"\n  >>> Port shift mode: {mode}")
-        with open(rsd_file, 'rb') as f:
-            wf_p, _, nav_p, sign_p = process_side(
-                f, ss_port, "Port", -1, transformer=transformer,
-                payload_mode_override=mode,
-                reverse_samples=REVERSE_PORT_SAMPLES,
-                heading_offset_deg=PORT_HEADING_OFFSET_DEG,
-            )
-        out_file = os.path.join(shift_dir, f"port_{mode}.tif")
-        save_geotiff(
-            wf_p, nav_p, sign_p, output_resolution, out_file,
-            raster_crs=output_crs,
-            transformer=mode_transformer,
-        )
-
-    print("  Port shift bakeoff complete.")
-
-
-def run_port_source_bakeoff(rsd_file, ss_port, output_dir, output_resolution,
-                            output_crs=None, transformer=None, coord_type='projected'):
-    """
-    Compare tail-based and son_offset-anchored payload extraction modes for port.
-    """
-    src_dir = os.path.join(output_dir, "port_source_bakeoff")
-    os.makedirs(src_dir, exist_ok=True)
-    print("\n--- Port Source Bakeoff ---")
-    print(f"  Writing source mosaics to: {src_dir}")
-
-    mode_transformer = transformer if coord_type == 'geographic' else None
-    modes = ["u8_odd", "son_odd", "son_even", "son_u8", "son_u16_le", "son_u16_be"]
-
-    for mode in modes:
-        print(f"\n  >>> Port source mode: {mode}")
-        with open(rsd_file, 'rb') as f:
-            wf_p, _, nav_p, sign_p = process_side(
-                f, ss_port, "Port", -1, transformer=transformer,
-                payload_mode_override=mode,
-                reverse_samples=REVERSE_PORT_SAMPLES,
-                heading_offset_deg=PORT_HEADING_OFFSET_DEG,
-            )
-        out_file = os.path.join(src_dir, f"port_{mode}.tif")
-        save_geotiff(
-            wf_p, nav_p, sign_p, output_resolution, out_file,
-            raster_crs=output_crs,
-            transformer=mode_transformer,
-        )
-
-    print("  Port source bakeoff complete.")
-
-
-def run_port_raw_bakeoff(rsd_file, ss_port, output_dir, output_crs=None, transformer=None,
-                         coord_type='projected'):
-    """
-    Port-only raw decode bakeoff to isolate payload packing/order issues.
-    """
-    raw_dir = os.path.join(output_dir, "port_raw_bakeoff")
-    os.makedirs(raw_dir, exist_ok=True)
-    print("\n--- Port Raw Diagnostic Bakeoff ---")
-    print(f"  Writing raw diagnostic mosaics to: {raw_dir}")
-
-    mode_transformer = transformer if coord_type == 'geographic' else None
-    modes = [
-        "u8_odd", "u8_even", "u8_odd_hi4", "u8_odd_lo4",
-        "son_odd", "son_even", "son_odd_hi4", "son_odd_lo4",
-        "son_u8", "son_u8_hi4", "son_u8_lo4",
-    ]
-
-    for mode in modes:
-        print(f"\n  >>> Port raw mode: {mode}")
-        with open(rsd_file, 'rb') as f:
-            wf_p, _, nav_p, sign_p = process_side_raw_diagnostic(
-                f, ss_port, "Port", -1, transformer=transformer,
-                payload_mode_override=mode,
-                reverse_samples=REVERSE_PORT_SAMPLES,
-                heading_offset_deg=PORT_HEADING_OFFSET_DEG,
-            )
-        out_file = os.path.join(raw_dir, f"port_raw_{mode}.tif")
-        save_geotiff(
-            wf_p, nav_p, sign_p, PORT_RAW_BIN_SIZE_M, out_file,
-            raster_crs=output_crs,
-            transformer=mode_transformer,
-        )
-
-    print("  Port raw diagnostic bakeoff complete.")
-
-
-def run_port_channel_bakeoff(rsd_file, all_meta_file, output_dir, output_resolution,
-                             output_crs=None, transformer=None, coord_type='projected'):
-    """
-    Build alternate port candidates from global metadata channels.
-    """
-    if not os.path.exists(all_meta_file):
-        print(f"\n--- Port Channel Bakeoff ---")
-        print(f"  Global metadata missing: {all_meta_file}")
-        return
-
-    ch_dir = os.path.join(output_dir, "port_channel_bakeoff")
-    os.makedirs(ch_dir, exist_ok=True)
-
-    print("\n--- Port Channel Bakeoff ---")
-    print(f"  Source: {all_meta_file}")
-    print(f"  Writing channel mosaics to: {ch_dir}")
-
-    all_meta = pd.read_csv(all_meta_file)
-    mode_transformer = transformer if coord_type == 'geographic' else None
-
-    for ch_id in PORT_CHANNEL_IDS:
-        ch_df = all_meta[pd.to_numeric(all_meta.get('channel_id'), errors='coerce') == float(ch_id)].copy()
-        ch_df = ch_df.reset_index(drop=True)
-        if len(ch_df) == 0:
-            continue
-
-        for rev in [False, True]:
-            label = f"ch{int(ch_id)}_rev{'T' if rev else 'F'}"
-            print(f"\n  >>> Port channel candidate: {label} mode={PORT_CHANNEL_MODE}")
-            with open(rsd_file, 'rb') as f:
-                wf_p, _, nav_p, sign_p = process_side(
-                    f, ch_df, f"PortCandidate-{label}", -1, transformer=transformer,
-                    payload_mode_override=PORT_CHANNEL_MODE,
-                    reverse_samples=rev,
-                    heading_offset_deg=PORT_HEADING_OFFSET_DEG,
-                )
-            out_file = os.path.join(ch_dir, f"port_{PORT_CHANNEL_MODE}_{label}.tif")
-            save_geotiff(
-                wf_p, nav_p, sign_p, output_resolution, out_file,
-                raster_crs=output_crs,
-                transformer=mode_transformer,
-            )
-
-    print("  Port channel bakeoff complete.")
-
-
-# === Execution ===
-if __name__ == "__main__":
     print("=" * 60)
-    print("Garmin Sidescan Mosaic Generator")
+    print(f"Processing RSD: {RSD_BASENAME}")
     print("=" * 60)
     print(f"  Resolution:  {OUTPUT_RESOLUTION * 100:.0f} cm/pixel")
     print(f"  TVG:         {APPLY_TVG} (spreading={TVG_SPREADING_DB} dB, absorption={ABSORPTION_COEFF} dB/m)")
@@ -1935,29 +1627,19 @@ if __name__ == "__main__":
     print(f"  Gap fill:    {FILL_GAPS} (interpolation, max {MAX_FILL_DISTANCE}m)")
     print(f"  Overlap:     {OVERLAP_POLICY}")
     print(f"  Min speed:   {MIN_SPEED_MS} m/s")
-    print(f"  Stretch:     {STRETCH_LOW_PCT}-{STRETCH_HIGH_PCT} percentile")
+    if FIXED_STRETCH_LO is not None:
+        print(f"  Stretch:     FIXED LO={FIXED_STRETCH_LO}, HI={FIXED_STRETCH_HI}")
+    else:
+        print(f"  Stretch:     DYNAMIC {STRETCH_LOW_PCT}-{STRETCH_HIGH_PCT} percentile")
     print(f"  Log comp:    {APPLY_LOG_COMPRESSION} (scale={LOG_COMPRESSION_SCALE})")
-    print(f"  Range cfg:   fallback={MAX_RANGE_FALLBACK}m, port_override={PORT_MAX_RANGE_OVERRIDE_M}, scales P/S={PORT_RANGE_SCALE}/{STARBOARD_RANGE_SCALE}")
     print(f"  Row balance: {APPLY_ROW_BALANCE}")
-    print(f"  Payload mode:{PAYLOAD_MODE_OVERRIDE_PORT} (port), {PAYLOAD_MODE_OVERRIDE_STARBOARD} (starboard)")
-    print(f"  Reverse samp:{REVERSE_PORT_SAMPLES} (port), {REVERSE_STARBOARD_SAMPLES} (starboard)")
-    print(f"  Heading off: {PORT_HEADING_OFFSET_DEG} (port), {STARBOARD_HEADING_OFFSET_DEG} (starboard)")
-    print(f"  Bakeoff:     {ENABLE_PAYLOAD_BAKEOFF}")
-    print(f"  Bakeoff ext: {ENABLE_EXTRA_PAYLOAD_BAKEOFF}")
-    print(f"  Port orient: {ENABLE_PORT_ORIENTATION_BAKEOFF}")
-    print(f"  Port shift:  {ENABLE_PORT_SHIFT_BAKEOFF}")
-    print(f"  Port source: {ENABLE_PORT_SOURCE_BAKEOFF}")
-    print(f"  Port raw:    {ENABLE_PORT_RAW_BAKEOFF} (bin={PORT_RAW_BIN_SIZE_M}m)")
-    print(f"  Port ch src: {ENABLE_PORT_CHANNEL_BAKEOFF} (channels={PORT_CHANNEL_IDS}, mode={PORT_CHANNEL_MODE})")
-    print(f"  Port ch use: {USE_PORT_CHANNEL_OVERRIDE} (channel={PORT_CHANNEL_OVERRIDE_ID})")
-    print(f"  Nadir fill:  {APPLY_DOWNSCAN_NADIR_FILL} (src={DOWNSCAN_META_NAME}, strip={DOWNSCAN_STRIP_WIDTH_M}m)")
     print()
 
     # Ensure metadata exists
     print("Checking metadata files...")
     if not ensure_metadata_exists(RSD_FILE, META_DIR):
-        print("\nFailed to generate or find metadata files. Cannot proceed.")
-        exit(1)
+        print(f"\nFailed to generate or find metadata files for {RSD_BASENAME}. Skipping.")
+        return
     print()
 
     print("Loading metadata...")
@@ -1970,10 +1652,6 @@ if __name__ == "__main__":
         ss_port_alt = all_meta[channel_vals == float(PORT_CHANNEL_OVERRIDE_ID)].copy()
         ss_port_alt = ss_port_alt.reset_index(drop=True)
 
-        # Collision guard: if the override channel ID matches starboard's own
-        # channel ID, applying it would route port to read starboard records,
-        # producing a mirrored mosaic. Channel IDs vary by file, so the
-        # override winner from one RSD isn't portable to another.
         star_channel = None
         if 'channel_id' in ss_star.columns:
             ch_vals = pd.to_numeric(ss_star['channel_id'], errors='coerce').dropna()
@@ -1983,7 +1661,7 @@ if __name__ == "__main__":
         if star_channel is not None and star_channel == PORT_CHANNEL_OVERRIDE_ID:
             print(f"  WARNING: Port channel override {PORT_CHANNEL_OVERRIDE_ID} "
                   f"matches starboard's channel_id — skipping override to avoid "
-                  f"mirrored mosaic. Re-run the port channel bakeoff for this file.")
+                  f"mirrored mosaic.")
         elif len(ss_port_alt) > 0:
             ss_port = ss_port_alt
             print(f"  Port source override: channel_id={PORT_CHANNEL_OVERRIDE_ID} from All-Garmin-Sonar-MetaData.csv")
@@ -1998,7 +1676,6 @@ if __name__ == "__main__":
 
     if 'lon' in cols and 'lat' in cols:
         coord_type = 'geographic'
-        # Auto-detect UTM zone from data centroid
         all_lats = pd.concat([ss_port['lat'], ss_star['lat']]).dropna()
         all_lons = pd.concat([ss_port['lon'], ss_star['lon']]).dropna()
         epsg = determine_utm_epsg(all_lats.values, all_lons.values)
@@ -2021,69 +1698,7 @@ if __name__ == "__main__":
     print(f"  Port pings:  {len(ss_port)}")
     print(f"  Star pings:  {len(ss_star)}")
 
-    if ENABLE_PAYLOAD_BAKEOFF:
-        run_payload_bakeoff(
-            RSD_FILE,
-            ss_port,
-            ss_star,
-            OUTPUT_DIR,
-            OUTPUT_RESOLUTION,
-            output_crs=output_crs,
-            transformer=transformer,
-            coord_type=coord_type,
-        )
-    if ENABLE_PORT_ORIENTATION_BAKEOFF:
-        run_port_orientation_bakeoff(
-            RSD_FILE,
-            ss_port,
-            OUTPUT_DIR,
-            OUTPUT_RESOLUTION,
-            output_crs=output_crs,
-            transformer=transformer,
-            coord_type=coord_type,
-        )
-    if ENABLE_PORT_SHIFT_BAKEOFF:
-        run_port_shift_bakeoff(
-            RSD_FILE,
-            ss_port,
-            OUTPUT_DIR,
-            OUTPUT_RESOLUTION,
-            output_crs=output_crs,
-            transformer=transformer,
-            coord_type=coord_type,
-        )
-    if ENABLE_PORT_SOURCE_BAKEOFF:
-        run_port_source_bakeoff(
-            RSD_FILE,
-            ss_port,
-            OUTPUT_DIR,
-            OUTPUT_RESOLUTION,
-            output_crs=output_crs,
-            transformer=transformer,
-            coord_type=coord_type,
-        )
-    if ENABLE_PORT_RAW_BAKEOFF:
-        run_port_raw_bakeoff(
-            RSD_FILE,
-            ss_port,
-            OUTPUT_DIR,
-            output_crs=output_crs,
-            transformer=transformer,
-            coord_type=coord_type,
-        )
-    if ENABLE_PORT_CHANNEL_BAKEOFF:
-        run_port_channel_bakeoff(
-            RSD_FILE,
-            ALL_META_FILE,
-            OUTPUT_DIR,
-            OUTPUT_RESOLUTION,
-            output_crs=output_crs,
-            transformer=transformer,
-            coord_type=coord_type,
-        )
-
     with open(RSD_FILE, 'rb') as f:
-        # Process both sides
         wf_p, tex_p, nav_p, sign_p = process_side(
             f, ss_port, "Port", -1, transformer=transformer,
             payload_mode_override=PAYLOAD_MODE_OVERRIDE_PORT,
@@ -2146,7 +1761,20 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Done! Output files saved to:", OUTPUT_DIR)
     print("=" * 60)
-    print("\nOutputs:")
-    print("  port_intensity.tif / star_intensity.tif - Individual sides")
-    print("  intensity.tif - Merged backscatter mosaic")
-    print("  texture.tif   - Local std deviation texture (high = rough/hard)")
+
+
+
+# === Execution ===
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Garmin Sidescan Mosaic Generator")
+    print("=" * 60)
+
+    if not os.path.exists(RSD_FILE):
+        print(f"Input RSD file does not exist: {RSD_FILE}")
+        print("Set GARMIN_RSD_FILE environment variable or edit RSD_FILE in the script.")
+        sys.exit(1)
+
+    process_single_rsd(RSD_FILE)
+
+

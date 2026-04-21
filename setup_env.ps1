@@ -1,40 +1,47 @@
 # setup_env.ps1
-# This script sets up a Python virtual environment and installs dependencies for garmin_mosaic.py
+# This script sets up a Python virtual environment and installs dependencies.
+
+$ErrorActionPreference = "Stop"
 
 Write-Host "--- Garmin Mosaic Setup Script ---" -ForegroundColor Cyan
 
-# 1. Check if Python is installed
 try {
-    $pythonVersion = python --version
-    Write-Host "✓ Python found: $pythonVersion" -ForegroundColor Green
-} catch {
-    Write-Host "✗ Error: Python is not installed or not in your PATH." -ForegroundColor Red
+    $pythonVersion = python --version 2>&1
+    Write-Host "[OK] Python found: $pythonVersion" -ForegroundColor Green
+}
+catch {
+    Write-Host "[ERROR] Python is not installed or not in your PATH." -ForegroundColor Red
     exit 1
 }
 
-# 2. Create Virtual Environment
 Write-Host "Creating virtual environment in .venv..." -ForegroundColor Yellow
 python -m venv .venv
-
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "✗ Failed to create virtual environment." -ForegroundColor Red
+    Write-Host "[ERROR] Failed to create virtual environment." -ForegroundColor Red
     exit 1
 }
 
-# 3. Upgrade pip and Install Dependencies
-Write-Host "Installing dependencies from requirements.txt..." -ForegroundColor Yellow
-& .\.venv\Scripts\python.exe -m pip install --upgrade pip
-& .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "----------------------------------------------------" -ForegroundColor Green
-    Write-Host "✓ Setup complete!" -ForegroundColor Green
-    Write-Host "To use the environment, run:" -ForegroundColor White
-    Write-Host "  .\.venv\Scripts\Activate.ps1" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "To run the mosaic script:" -ForegroundColor White
-    Write-Host "  python Misc/garmin_mosaic.py" -ForegroundColor Yellow
-    Write-Host "----------------------------------------------------" -ForegroundColor Green
-} else {
-    Write-Host "✗ An error occurred during dependency installation." -ForegroundColor Red
+$venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $venvPython)) {
+    Write-Host "[ERROR] Virtual environment Python not found at $venvPython" -ForegroundColor Red
+    exit 1
 }
+
+Write-Host "Installing dependencies from requirements.txt..." -ForegroundColor Yellow
+& $venvPython -m pip install --upgrade pip
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] Failed to upgrade pip." -ForegroundColor Red
+    exit 1
+}
+
+& $venvPython -m pip install -r requirements.txt
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] Dependency installation failed." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "----------------------------------------------------" -ForegroundColor Green
+Write-Host "[OK] Setup complete!" -ForegroundColor Green
+Write-Host "Virtual environment: .\.venv" -ForegroundColor White
+Write-Host "Mosaic script: .\garmin_mosaic.py" -ForegroundColor White
+Write-Host "----------------------------------------------------" -ForegroundColor Green
