@@ -115,8 +115,15 @@ REVERSE_PORT_SAMPLES = False
 REVERSE_STARBOARD_SAMPLES = False
 PORT_HEADING_OFFSET_DEG = 0.0    # Additional heading correction per side
 STARBOARD_HEADING_OFFSET_DEG = 0.0
-USE_PORT_CHANNEL_OVERRIDE = True         # Use channel override for normal port processing
-PORT_CHANNEL_OVERRIDE_ID = 1             # Port channel_id in All-Garmin-Sonar-MetaData.csv
+# Channel routing
+# Pingverter mis-labels port/star on some RSDs (writes the wrong beam into
+# B002_ss_port_meta.csv / B003_ss_star_meta.csv). When AUTO_DETECT_SIDE_CHANNELS
+# is True, the script picks port/star directly from `port_star_id` in
+# All-Garmin-Sonar-MetaData.csv — negative angle = port, positive = starboard.
+# Manual overrides take precedence if not None.
+AUTO_DETECT_SIDE_CHANNELS = True
+PORT_CHANNEL_OVERRIDE_ID = None          # Force port channel_id (None = auto-detect)
+STAR_CHANNEL_OVERRIDE_ID = None          # Force starboard channel_id (None = auto-detect)
 
 # EGN stabilization
 EGN_SMOOTH_WINDOW = 250       # Smoothing width for beam-pattern estimate
@@ -499,6 +506,35 @@ def smooth_and_filter_nav(nav_data, waterfall_rows, transformer=None):
     smoothed_nav = [(x_vals[i], y_vals[i], heading_smooth[i])
                     for i in range(len(nav_data))]
     return smoothed_nav, waterfall_rows
+
+
+def detect_side_channels(all_meta):
+    """
+    Identify port and starboard sidescan channels from All-Garmin-Sonar-MetaData.csv
+    using the `port_star_id` column (beam angle from boat centerline).
+
+    Pingverter mis-labels port/star on some RSDs, so trusting B002/B003 filenames
+    is unreliable. The beam angle is recorded per-ping by the Garmin device itself:
+      - negative port_star_id (e.g. -60°) = port
+      - positive port_star_id (e.g. +60°) = starboard
+      - NaN = not a sidescan beam (downscan, vertical, etc.)
+
+    Returns (port_channel_id, star_channel_id), either may be None if not found.
+    """
+    if 'channel_id' not in all_meta.columns or 'port_star_id' not in all_meta.columns:
+        return None, None
+
+    side = all_meta[['channel_id', 'port_star_id']].dropna()
+    if side.empty:
+        return None, None
+
+    medians = side.groupby('channel_id')['port_star_id'].median()
+    if medians.empty:
+        return None, None
+
+    port_channel = int(medians.idxmin()) if medians.min() < 0 else None
+    star_channel = int(medians.idxmax()) if medians.max() > 0 else None
+    return port_channel, star_channel
 
 
 def determine_utm_epsg(lats, lons):
@@ -899,12 +935,21 @@ def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload
     skipped_slow = 0
     skipped_no_nav = 0
     skipped_decode = 0
+    skipped_meta_nan = 0
+    skipped_offset_eof = 0
+    skipped_short_record = 0
+    skipped_empty_payload = 0
+    skipped_bad_range = 0
+    skipped_empty_corrected = 0
+    skipped_exception = 0
 
     for idx, row in tqdm(meta_df.iterrows(), total=len(meta_df), desc="Reading"):
         if pd.isna(row['index']) or pd.isna(row['data_size']):
+            skipped_meta_nan += 1
             continue
         offset = int(row['index'])
         if offset >= file_size:
+            skipped_offset_eof += 1
             continue
 
         # Skip near-stationary pings (GPS pileup)
@@ -921,6 +966,7 @@ def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload
             record_data = read_ping_record(rsd_handle, file_size, offset, body_size, next_off)
 
             if len(record_data) < 32:
+                skipped_short_record += 1
                 continue
 
             if has_ping_cnt and pd.notna(row['ping_cnt']) and row['ping_cnt'] > 0:
@@ -939,6 +985,7 @@ def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload
                 continue
 
             if len(raw_intensities) == 0:
+                skipped_empty_payload += 1
                 continue
             if reverse_samples:
                 raw_intensities = raw_intensities[::-1].copy()
@@ -960,7 +1007,8 @@ def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload
             else:
                 ping_max_range *= STARBOARD_RANGE_SCALE
 
-            if ping_max_range <= 0:
+            if ping_max_range is None or ping_max_range <= 0:
+                skipped_bad_range += 1
                 continue
 
             # Compute slant ranges for this ping's samples
@@ -988,16 +1036,40 @@ def process_side(rsd_handle, meta_df, side_name, sign, transformer=None, payload
                 waterfall_rows.append(corrected)
                 x_nav, y_nav, h_nav = nav_point
                 nav_data.append((x_nav, y_nav, (h_nav + heading_offset_deg) % 360.0))
+            else:
+                skipped_empty_corrected += 1
 
         except Exception:
+            skipped_exception += 1
             continue
+
+    total_in = len(meta_df)
+    total_kept = len(waterfall_rows)
+    total_skipped = (skipped_slow + skipped_no_nav + skipped_decode + skipped_meta_nan
+                     + skipped_offset_eof + skipped_short_record + skipped_empty_payload
+                     + skipped_bad_range + skipped_empty_corrected + skipped_exception)
 
     if skipped_slow > 0:
         print(f"  Skipped {skipped_slow} near-stationary pings (speed < {MIN_SPEED_MS} m/s)")
+    if skipped_meta_nan > 0:
+        print(f"  Skipped {skipped_meta_nan} pings with NaN index or data_size in metadata")
+    if skipped_offset_eof > 0:
+        print(f"  Skipped {skipped_offset_eof} pings with offset past end of file")
+    if skipped_short_record > 0:
+        print(f"  Skipped {skipped_short_record} pings with record < 32 bytes")
+    if skipped_empty_payload > 0:
+        print(f"  Skipped {skipped_empty_payload} pings with empty decoded payload")
+    if skipped_bad_range > 0:
+        print(f"  Skipped {skipped_bad_range} pings with non-positive max_range")
+    if skipped_empty_corrected > 0:
+        print(f"  Skipped {skipped_empty_corrected} pings where ground-range correction returned empty (depth >= max_range?)")
     if skipped_no_nav > 0:
         print(f"  Skipped {skipped_no_nav} pings with missing navigation")
     if skipped_decode > 0:
         print(f"  Skipped {skipped_decode} pings that could not decode payload")
+    if skipped_exception > 0:
+        print(f"  Skipped {skipped_exception} pings due to read/decode exceptions")
+    print(f"  Kept {total_kept} / {total_in} pings ({total_skipped} skipped)")
 
     if not waterfall_rows:
         print("  No valid data found.")
@@ -1646,27 +1718,43 @@ def process_single_rsd(file_path):
     ss_port = pd.read_csv(os.path.join(META_DIR, "B002_ss_port_meta.csv"))
     ss_star = pd.read_csv(os.path.join(META_DIR, "B003_ss_star_meta.csv"))
 
-    if USE_PORT_CHANNEL_OVERRIDE and os.path.exists(ALL_META_FILE):
+    # Resolve port/star channels. Pingverter's B002/B003 split is unreliable
+    # on some RSDs, so prefer per-ping `port_star_id` from the master metadata.
+    if os.path.exists(ALL_META_FILE):
         all_meta = pd.read_csv(ALL_META_FILE)
         channel_vals = pd.to_numeric(all_meta.get('channel_id'), errors='coerce')
-        ss_port_alt = all_meta[channel_vals == float(PORT_CHANNEL_OVERRIDE_ID)].copy()
-        ss_port_alt = ss_port_alt.reset_index(drop=True)
 
-        star_channel = None
-        if 'channel_id' in ss_star.columns:
-            ch_vals = pd.to_numeric(ss_star['channel_id'], errors='coerce').dropna()
-            if len(ch_vals) > 0:
-                star_channel = int(ch_vals.iloc[0])
+        port_cid = PORT_CHANNEL_OVERRIDE_ID
+        star_cid = STAR_CHANNEL_OVERRIDE_ID
 
-        if star_channel is not None and star_channel == PORT_CHANNEL_OVERRIDE_ID:
-            print(f"  WARNING: Port channel override {PORT_CHANNEL_OVERRIDE_ID} "
-                  f"matches starboard's channel_id — skipping override to avoid "
-                  f"mirrored mosaic.")
-        elif len(ss_port_alt) > 0:
-            ss_port = ss_port_alt
-            print(f"  Port source override: channel_id={PORT_CHANNEL_OVERRIDE_ID} from All-Garmin-Sonar-MetaData.csv")
+        if AUTO_DETECT_SIDE_CHANNELS and (port_cid is None or star_cid is None):
+            detected_port, detected_star = detect_side_channels(all_meta)
+            if port_cid is None:
+                port_cid = detected_port
+            if star_cid is None:
+                star_cid = detected_star
+            if detected_port is not None or detected_star is not None:
+                print(f"  Auto-detected sidescan channels from port_star_id: "
+                      f"port={detected_port}, starboard={detected_star}")
+
+        if port_cid is not None and star_cid is not None and port_cid == star_cid:
+            print(f"  WARNING: port and starboard resolved to the same channel "
+                  f"({port_cid}); falling back to pingverter B002/B003 split.")
         else:
-            print(f"  WARNING: Port channel override {PORT_CHANNEL_OVERRIDE_ID} had no rows; using default B002 metadata")
+            if port_cid is not None:
+                ss_port_alt = all_meta[channel_vals == float(port_cid)].copy().reset_index(drop=True)
+                if len(ss_port_alt) > 0:
+                    ss_port = ss_port_alt
+                    print(f"  Port source: channel_id={port_cid} from All-Garmin-Sonar-MetaData.csv ({len(ss_port_alt)} rows)")
+                else:
+                    print(f"  WARNING: port channel {port_cid} had no rows; using default B002 metadata")
+            if star_cid is not None:
+                ss_star_alt = all_meta[channel_vals == float(star_cid)].copy().reset_index(drop=True)
+                if len(ss_star_alt) > 0:
+                    ss_star = ss_star_alt
+                    print(f"  Star source: channel_id={star_cid} from All-Garmin-Sonar-MetaData.csv ({len(ss_star_alt)} rows)")
+                else:
+                    print(f"  WARNING: starboard channel {star_cid} had no rows; using default B003 metadata")
 
     # Detect coordinate type and auto-determine UTM CRS
     coord_type = 'projected'
