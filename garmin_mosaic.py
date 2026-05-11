@@ -45,9 +45,9 @@ ALL_META_FILE = os.path.join(META_DIR, "All-Garmin-Sonar-MetaData.csv")
 # Processing Parameters
 OUTPUT_RESOLUTION = 0.05    # 5cm per pixel
 TEXTURE_WINDOW_SIZE = 15    # Texture analysis window (~1.5m at 5cm res)
-MAX_RANGE_FALLBACK = 15.0   # Fallback if per-ping max_range not in metadata
-PORT_MAX_RANGE_OVERRIDE_M = 15.0       # Force port swath width; set to None to use per-ping metadata
-STARBOARD_MAX_RANGE_OVERRIDE_M = 15  # Force starboard swath width; set to None to use per-ping metadata
+MAX_RANGE_FALLBACK = None   # Fallback if per-ping max_range not in metadata
+PORT_MAX_RANGE_OVERRIDE_M = None      # Force port swath width; set to None to use per-ping metadata
+STARBOARD_MAX_RANGE_OVERRIDE_M = None  # Force starboard swath width; set to None to use per-ping metadata
 PORT_RANGE_SCALE = 1.0                 # Additional multiplicative range tuning for port
 STARBOARD_RANGE_SCALE = 1.0            # Additional multiplicative range tuning for starboard
 
