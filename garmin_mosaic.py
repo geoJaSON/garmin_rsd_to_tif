@@ -23,6 +23,7 @@ import pandas as pd
 import os
 import sys
 import math
+import traceback
 from scipy.interpolate import interp1d
 from scipy.ndimage import median_filter, uniform_filter
 import rasterio
@@ -33,7 +34,7 @@ from pyproj import CRS, Transformer
 
 # === Configuration ===
 # Point INPUT_PATH to a single .RSD file, or a directory containing multiple .RSD files.
-RSD_FILE = os.environ.get("GARMIN_RSD_FILE", r"path_to_rsd_file")
+RSD_FILE = os.environ.get("GARMIN_RSD_FILE", r"C:\Users\jason\Downloads\11MAY26-1637-01.RSD")
 
 RSD_BASENAME = os.path.splitext(os.path.basename(RSD_FILE))[0]
 RSD_PARENT_DIR = os.path.dirname(RSD_FILE)
@@ -176,12 +177,337 @@ def ensure_metadata_exists(rsd_file, meta_dir, force_regenerate=False):
             print("  ERROR: Metadata files not found after generation")
             return False
 
+    except KeyError as e:
+        if e.args and e.args[0] == "sample_cnt":
+            print("  pingverter is missing sample_cnt for this file; using local Garmin metadata fallback...")
+            return generate_garmin_metadata_fallback(rsd_file, meta_dir)
+        print(f"  ERROR generating metadata (KeyError): {e!r}")
+        traceback.print_exc()
+        return False
     except ImportError:
         print("  ERROR: pingverter library not found")
         print("  Install with: pip install pingverter")
         return False
     except Exception as e:
-        print(f"  ERROR generating metadata: {e}")
+        print(f"  ERROR generating metadata: {e!r}")
+        traceback.print_exc()
+        return False
+
+
+def decode_garmin_varint(value):
+    """
+    Decode Garmin variable-length depth fields.
+    """
+    if value is None or pd.isna(value):
+        return np.nan
+    if isinstance(value, np.void):
+        data = bytes(value)
+    elif isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+    else:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return np.nan
+
+    result = 0
+    shift = 0
+    for byte in data:
+        result |= (byte & 0x7F) << shift
+        shift += 7
+        if not (byte & 0x80):
+            break
+    return float(result)
+
+
+def safe_get_garmin_ping_header(parser, file_handle, offset):
+    """
+    Read one Garmin ping header without requiring every optional field.
+    """
+    ping_body_header = {
+        1: [("SP1_bh", "<u1"), ("channel_id_1", "<u1")],
+        10: [("SP0a", "<u1"), ("bottom_depth", "V2")],
+        11: [("SP0b", "<u1"), ("bottom_depth", "V3")],
+        13: [("SP0d", "<u1"), ("unknown_sp0d", "V5")],
+        18: [("SP12", "<u1"), ("drawn_bottom_depth", "V2")],
+        19: [("SP13", "<u1"), ("drawn_bottom_depth", "V3")],
+        21: [("SP15", "<u1"), ("unknown_sp15", "V5")],
+        25: [("SP19", "<u1"), ("first_sample_depth", "<u1")],
+        35: [("SP23", "<u1"), ("last_sample_depth", "V3")],
+        41: [("SP29", "<u1"), ("gain", "<u1")],
+        49: [("SP31", "<u1"), ("sample_status", "<u1")],
+        60: [("SP3c", "<u1"), ("sample_cnt", "<u4")],
+        65: [("SP41", "<u1"), ("shade_avail", "<u1")],
+        76: [("SP4c", "<u1"), ("scposn_lat", "<u4")],
+        84: [("SP54", "<u1"), ("scposn_lon", "<u4")],
+        92: [("SP5c", "<u1"), ("water_temp", "<f4")],
+        97: [("SP61", "<u1"), ("beam", "<u1")],
+    }
+    beam_info = {
+        1: [("SP1_bi", "<u1"), ("port_star_beam_angle", "<u1")],
+        9: [("SP9", "<u1"), ("fore_aft_beam_angle", "<u1")],
+        17: [("SP11", "<u1"), ("port_star_elem_angle", "<u1")],
+        25: [("SP19_bi", "<u1"), ("fore_aft_elem_angle", "<u1")],
+        47: [
+            ("SP2f", "<u1"), ("su2_len", "<u1"), ("su2_fcnt", "<u1"),
+            ("su2_f0", "<u1"), ("port_star_id", "<f4"),
+            ("su2_f1", "<u1"), ("su2_f1_unkown", "<f4"),
+        ],
+        55: [
+            ("SP37", "<u1"), ("su3_len", "<u1"), ("su3_fcnt", "<u1"),
+            ("su3_f0", "<u1"), ("su3_f0_unknown", "<u1"),
+            ("su3_f1", "<u1"), ("su3_f1_unkown", "<f4"),
+            ("su3_f2", "<u1"), ("su3_f2_unkown", "<f4"),
+            ("su3_f3", "<u1"), ("su3_f3_unkown", "<f4"),
+            ("su3_f4", "<u1"), ("su3_f4_unkown", "<f4"),
+            ("su3_f5", "<u1"), ("su3_f5_unkown", "<f4"),
+            ("su3_f6", "<u1"), ("su3_f6_unkown", "<f4"),
+        ],
+        115: [("SP73", "<u1"), ("interrogation_id", "<u2"), ("son_byte_len", "<u1")],
+    }
+
+    file_handle.seek(offset)
+    header_buffer = file_handle.read(parser.pingHeaderLen)
+    if len(header_buffer) < parser.pingHeaderLen:
+        return None, parser.file_len
+
+    header = np.frombuffer(header_buffer, dtype=np.dtype(parser.son_header_struct))
+    out_dict = {name: header[name][0].item() for name in header.dtype.fields}
+
+    if out_dict.get("state") != 2:
+        return None, offset + parser.pingHeaderLenFirst
+
+    record_body_count = parser._fread_dat(file_handle, 1, "B")[0]
+    out_dict["record_body_fcnt"] = record_body_count
+
+    field_count = min(record_body_count, 13)
+    has_beam_info = record_body_count > 13
+
+    for _ in range(field_count):
+        field_id = parser._fread_dat(file_handle, 1, "B")[0]
+        field_struct = ping_body_header.get(field_id)
+        if field_struct is None:
+            continue
+
+        out_dict[field_struct[0][0]] = field_id
+        dtype = np.dtype(field_struct[1:])
+        field_buffer = file_handle.read(dtype.itemsize)
+        if len(field_buffer) < dtype.itemsize:
+            return None, parser.file_len
+
+        field_values = np.frombuffer(field_buffer, dtype=dtype)
+        for name in field_values.dtype.fields:
+            out_dict[name] = field_values[name][0].item()
+
+    if has_beam_info:
+        parser._fread_dat(file_handle, 1, "B")
+        parser._fread_dat(file_handle, 1, "B")
+        beam_field_count = parser._fread_dat(file_handle, 1, "B")[0]
+
+        for _ in range(beam_field_count):
+            field_id = parser._fread_dat(file_handle, 1, "B")[0]
+            field_struct = beam_info.get(field_id)
+            if field_struct is None:
+                continue
+
+            out_dict[field_struct[0][0]] = field_id
+            dtype = np.dtype(field_struct[1:])
+            field_buffer = file_handle.read(dtype.itemsize)
+            if len(field_buffer) < dtype.itemsize:
+                return None, parser.file_len
+
+            field_values = np.frombuffer(field_buffer, dtype=dtype)
+            for name in field_values.dtype.fields:
+                out_dict[name] = field_values[name][0].item()
+
+    out_dict["index"] = offset
+    data_size = int(out_dict.get("data_size", 0))
+    next_ping = offset + parser.pingHeaderLen + data_size + 12
+    return out_dict, next_ping
+
+
+def add_navigation_fields(meta_df, recording_start_seconds):
+    """
+    Convert Garmin header fields into the PINGMapper-style columns used below.
+    """
+    feet_to_m = 3.2808399
+
+    for src, dst in (("bottom_depth", "inst_dep_m"), ("drawn_bottom_depth", "keel_depth_m"),
+                     ("last_sample_depth", "max_range")):
+        if src in meta_df.columns:
+            meta_df[dst] = meta_df[src].apply(decode_garmin_varint) / 1000.0 / feet_to_m
+
+    if "first_sample_depth" in meta_df.columns:
+        meta_df["min_range"] = pd.to_numeric(meta_df["first_sample_depth"], errors="coerce") / feet_to_m
+    else:
+        meta_df["min_range"] = 0.0
+
+    if "sample_cnt" in meta_df.columns:
+        sample_counts = pd.to_numeric(meta_df["sample_cnt"], errors="coerce")
+    else:
+        sample_counts = pd.Series(np.nan, index=meta_df.index)
+    meta_df["ping_cnt"] = sample_counts.fillna(FALLBACK_SAMPLE_COUNT).astype(int)
+
+    if "water_temp" in meta_df.columns:
+        meta_df["tempC"] = meta_df["water_temp"]
+
+    meta_df["time_s"] = pd.to_numeric(meta_df.get("recording_time_ms"), errors="coerce") / 1000.0
+    meta_df["unix_time"] = recording_start_seconds + meta_df["time_s"]
+
+    meta_df["lat"] = pd.to_numeric(meta_df.get("scposn_lat"), errors="coerce") * 360.0 / (1 << 32)
+    meta_df["lon"] = pd.to_numeric(meta_df.get("scposn_lon"), errors="coerce") * 360.0 / (1 << 32)
+    meta_df["lat"] = np.where(meta_df["lat"] > 180.0, meta_df["lat"] - 360.0, meta_df["lat"])
+    meta_df["lon"] = np.where(meta_df["lon"] > 180.0, meta_df["lon"] - 360.0, meta_df["lon"])
+
+    valid_nav = (
+        np.isfinite(meta_df["lon"])
+        & np.isfinite(meta_df["lat"])
+        & meta_df["lon"].between(-180.0, 180.0)
+        & meta_df["lat"].between(-90.0, 90.0)
+        & ((meta_df["lon"] != 0.0) | (meta_df["lat"] != 0.0))
+    )
+    meta_df = meta_df.loc[valid_nav].copy()
+    if meta_df.empty:
+        return meta_df
+
+    epsg = determine_utm_epsg(meta_df["lat"].to_numpy(dtype=float), meta_df["lon"].to_numpy(dtype=float))
+    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+    easting, northing = transformer.transform(
+        meta_df["lon"].to_numpy(dtype=float),
+        meta_df["lat"].to_numpy(dtype=float),
+    )
+    meta_df["e"] = easting
+    meta_df["n"] = northing
+    meta_df["utm_zone"] = epsg % 100
+
+    meta_df = meta_df.sort_values("index").reset_index(drop=True)
+    dx = np.diff(meta_df["e"].to_numpy(dtype=float), append=np.nan)
+    dy = np.diff(meta_df["n"].to_numpy(dtype=float), append=np.nan)
+    heading = (np.degrees(np.arctan2(dx, dy)) + 360.0) % 360.0
+    if len(heading) > 1:
+        heading[-1] = heading[-2]
+    meta_df["instr_heading"] = pd.Series(heading).replace(0, np.nan).interpolate().bfill().ffill().fillna(0.0).round(1)
+
+    dt = np.diff(meta_df["time_s"].to_numpy(dtype=float), prepend=np.nan)
+    dist = np.sqrt(
+        np.diff(meta_df["e"].to_numpy(dtype=float), prepend=np.nan) ** 2
+        + np.diff(meta_df["n"].to_numpy(dtype=float), prepend=np.nan) ** 2
+    )
+    speed = np.divide(dist, dt, out=np.full_like(dist, np.nan), where=dt > 0)
+    meta_df["speed_ms"] = pd.Series(speed).interpolate().bfill().ffill().fillna(0.0).round(1)
+    meta_df["dist"] = np.nan_to_num(dist, nan=0.0)
+    meta_df["trk_dist"] = np.cumsum(meta_df["dist"])
+    meta_df["transect"] = 0
+
+    valid_sample_counts = meta_df["ping_cnt"].where(meta_df["ping_cnt"] > 0, FALLBACK_SAMPLE_COUNT)
+    meta_df["pixM"] = (meta_df["max_range"] - meta_df["min_range"]) / valid_sample_counts
+
+    estimated_offset = meta_df["data_size"] - (meta_df["ping_cnt"] * 2) + 37
+    meta_df["son_offset"] = estimated_offset.where(estimated_offset > 0, np.nan)
+    meta_df["record_num"] = np.arange(len(meta_df))
+
+    return meta_df
+
+
+def write_fallback_beam_csvs(meta_df, meta_dir):
+    """
+    Write the same beam metadata CSV names normally produced by pingverter.
+    """
+    beam_set = {}
+    port_channel = star_channel = None
+    if "port_star_id" in meta_df.columns:
+        port_channel, star_channel = detect_side_channels(meta_df)
+
+    channel_ids = sorted(pd.to_numeric(meta_df["channel_id"], errors="coerce").dropna().astype(int).unique())
+    if len(channel_ids) >= 4:
+        beam_set[channel_ids[0]] = ("ds_hifreq", 1)
+        beam_set[channel_ids[1]] = ("ds_vhifreq", 4)
+        beam_set[channel_ids[2]] = ("ss_port", 2)
+        beam_set[channel_ids[3]] = ("ss_star", 3)
+    elif len(channel_ids) == 2:
+        beam_set[channel_ids[0]] = ("ds_hifreq", 1)
+        beam_set[channel_ids[1]] = ("ds_vhifreq", 4)
+    elif len(channel_ids) == 1:
+        beam_set[channel_ids[0]] = ("ds_hifreq", 1)
+
+    if port_channel is not None:
+        beam_set[int(port_channel)] = ("ss_port", 2)
+    if star_channel is not None:
+        beam_set[int(star_channel)] = ("ss_star", 3)
+
+    required_sides = {"ss_port", "ss_star"}
+    if not required_sides.issubset({name for name, _ in beam_set.values()}):
+        print(f"  ERROR: Could not identify both sidescan channels from channels: {channel_ids}")
+        return False
+
+    drop_prefixes = ("SP", "fp", "su")
+    for channel_id, group in meta_df.groupby("channel_id"):
+        mapped = beam_set.get(int(channel_id))
+        if mapped is None:
+            continue
+
+        beam_name, beam_num = mapped
+        group = group.copy().reset_index(drop=True)
+        group["beam"] = beam_num
+        group["chunk_id"] = (group.index // 500).astype(int)
+
+        cols_to_drop = [col for col in group.columns if col == "magic_number" or col.startswith(drop_prefixes)]
+        group = group.drop(columns=cols_to_drop, errors="ignore")
+        out_csv = os.path.join(meta_dir, f"B00{beam_num}_{beam_name}_meta.csv")
+        group.to_csv(out_csv, index=False)
+
+    return True
+
+
+def generate_garmin_metadata_fallback(rsd_file, meta_dir):
+    """
+    Build Garmin metadata locally when pingverter aborts on missing sample_cnt.
+    """
+    try:
+        from pingverter.garmin_class import gar
+    except ImportError:
+        print("  ERROR: pingverter library not found")
+        return False
+
+    os.makedirs(meta_dir, exist_ok=True)
+    all_meta_path = os.path.join(meta_dir, "All-Garmin-Sonar-MetaData.csv")
+
+    try:
+        parser = gar(inFile=str(rsd_file), nchunk=500, exportUnknown=False)
+        parser.metaDir = meta_dir
+        parser._getFileLen()
+        parser._parseFileHeader()
+        parser.son_struct, parser.son_header_struct, parser.record_body_header_len = parser._getPingHeaderStruct()
+
+        rows = []
+        offset = parser.headBytes
+        with open(rsd_file, "rb") as handle:
+            while offset < parser.file_len:
+                row, next_offset = safe_get_garmin_ping_header(parser, handle, offset)
+                if next_offset <= offset:
+                    break
+                offset = next_offset
+                if row:
+                    rows.append(row)
+
+        if not rows:
+            print("  ERROR: Local fallback found no Garmin ping headers")
+            return False
+
+        recording_start = float(parser.file_header.get("date_time_of_recording", 0))
+        meta_df = pd.DataFrame.from_dict(rows)
+        meta_df = add_navigation_fields(meta_df, recording_start)
+        if meta_df.empty:
+            print("  ERROR: Local fallback found no valid navigation rows")
+            return False
+
+        meta_df.to_csv(all_meta_path, index=False)
+        if write_fallback_beam_csvs(meta_df, meta_dir):
+            print("  Local metadata fallback complete!")
+            return True
+        return False
+    except Exception as e:
+        print(f"  ERROR in local Garmin metadata fallback: {e}")
         return False
 
 
